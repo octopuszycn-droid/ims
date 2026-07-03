@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { EChartsOption } from "echarts";
-import { Eye, EyeOff, GripVertical, Minus, Plus, X } from "lucide-react";
-import { api } from "./api";
+import { Eye, EyeOff, GripVertical, Loader2, Minus, Plus, X } from "lucide-react";
+import { ApiError, api } from "./api";
 import type {
   Brand,
   InventoryLog,
@@ -190,6 +190,7 @@ export function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isLoginLoading, setIsLoginLoading] = useState(false);
   const [users, setUsers] = useState<User[]>([]);
   const [brands, setBrands] = useState<Brand[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
@@ -245,6 +246,12 @@ export function App() {
     localStorage.setItem(pageKey, nextPage);
   }
 
+  function forceLogout() {
+    localStorage.removeItem(sessionKey);
+    setSession(null);
+    setMessage("");
+  }
+
   useEffect(() => {
     if (!session) return;
     if (isServerExpiryUrgent && localStorage.getItem(serverExpiryForceKey) !== serverExpiryDate) {
@@ -254,10 +261,8 @@ export function App() {
       setMessage("距离服务器到期不足 10 天，请重新登录确认");
       return;
     }
-    api.me(session.token).catch(() => {
-      localStorage.removeItem(sessionKey);
-      setSession(null);
-      setMessage("登录已过期，请重新登录");
+    api.me(session.token).catch((nextError) => {
+      if (nextError instanceof ApiError && nextError.status === 401) forceLogout();
     });
   }, [session, isServerExpiryUrgent]);
 
@@ -331,7 +336,9 @@ export function App() {
 
   async function handleLogin(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (isLoginLoading) return;
     setMessage("");
+    setIsLoginLoading(true);
     try {
       const nextSession = await api.login(username, password);
       if (isServerExpiryUrgent) localStorage.setItem(serverExpiryForceKey, serverExpiryDate);
@@ -346,9 +353,10 @@ export function App() {
       }
     } catch (nextError) {
       setMessage(nextError instanceof Error ? nextError.message : "登录失败");
+    } finally {
+      setIsLoginLoading(false);
     }
   }
-
   function handleLogout() {
     localStorage.removeItem(sessionKey);
     setSession(null);
@@ -587,11 +595,12 @@ export function App() {
         <form onSubmit={handleLogin} className="w-full max-w-sm rounded-lg border bg-white p-6 shadow-sm">
           <h1 className="text-xl font-semibold text-slate-950">威海博浪峰渔具IMS</h1>
           <div className="mt-6 space-y-3">
-            <Input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="英文用户名" />
-            <Input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="密码" type="password" />
+            <Input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="英文用户名" disabled={isLoginLoading} />
+            <Input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="密码" type="password" disabled={isLoginLoading} />
             {message && <p className="text-sm text-red-600">{message}</p>}
-            <Button className="w-full" type="submit">
-              登录
+            <Button className="w-full" type="submit" disabled={isLoginLoading}>
+              {isLoginLoading && <Loader2 className="h-4 w-4 animate-spin" />}
+              {isLoginLoading ? "登录中" : "登录"}
             </Button>
           </div>
         </form>

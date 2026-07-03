@@ -18,6 +18,16 @@ type RequestOptions = RequestInit & {
   token?: string;
 };
 
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 async function request<T>(url: string, options: RequestOptions = {}): Promise<T> {
   const headers = new Headers(options.headers);
   if (!(options.body instanceof FormData)) headers.set("Content-Type", "application/json");
@@ -25,7 +35,7 @@ async function request<T>(url: string, options: RequestOptions = {}): Promise<T>
   const response = await fetch(url, { ...options, headers });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(data.message || "请求失败");
+  if (!response.ok) throw new ApiError(data.message || "请求失败", response.status);
   return data as T;
 }
 
@@ -36,7 +46,7 @@ async function requestBlob(url: string, options: RequestOptions = {}) {
   if (!response.ok) {
     const text = await response.text();
     const data = text ? JSON.parse(text) : {};
-    throw new Error(data.message || "请求失败");
+    throw new ApiError(data.message || "请求失败", response.status);
   }
   return response.blob();
 }
