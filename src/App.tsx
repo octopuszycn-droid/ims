@@ -1562,8 +1562,8 @@ function LogTable({
           </div>
           {canWrite && (
             <div className="flex items-center gap-2">
-              <Button variant="secondary" onClick={onOutbound}>出库</Button>
-              <Button variant="secondary" onClick={onInbound}>入库</Button>
+              <Button onClick={onOutbound}>出库</Button>
+              <Button onClick={onInbound}>入库</Button>
             </div>
           )}
         </div>
