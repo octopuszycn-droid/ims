@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { EChartsOption } from "echarts";
-import { GripVertical, Minus, Plus, X } from "lucide-react";
+import { Eye, EyeOff, GripVertical, Minus, Plus, X } from "lucide-react";
 import { api } from "./api";
 import type {
   Brand,
@@ -61,6 +61,8 @@ type PageKey =
 type DialogType = null | "user" | "brand" | "product" | "sku" | "inbound" | "outbound";
 type LogFilters = { startAt: string; endAt: string };
 type SkuFilters = { brandId: number | ""; productId: number | "" };
+type FilterBrandOption = { id: number; name: string };
+type FilterProductOption = { id: number; brandId: number; name: string };
 
 type NavGroup = {
   label: string;
@@ -200,6 +202,7 @@ export function App() {
   const [logFilters, setLogFilters] = useState<LogFilters>({ startAt: "", endAt: "" });
   const [logFilterDraft, setLogFilterDraft] = useState<LogFilters>({ startAt: "", endAt: "" });
   const [skuFilters, setSkuFilters] = useState<SkuFilters>({ brandId: "", productId: "" });
+  const [inventoryDetailFilters, setInventoryDetailFilters] = useState<SkuFilters>({ brandId: "", productId: "" });
   const [dialog, setDialog] = useState<DialogType>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<Record<string, any>>({});
@@ -457,7 +460,7 @@ export function App() {
     try {
       const token = session.token;
       if (dialog === "user") {
-        if (form.password !== form.confirmPassword) throw new Error("两次密码不一致");
+        if (!editingId && form.password !== form.confirmPassword) throw new Error("两次密码不一致");
         const payload = {
           username: String(form.username || "").trim(),
           name: String(form.name || "").trim(),
@@ -684,6 +687,9 @@ export function App() {
           {activePage === "inventory-detail" && (
             <SkuInventoryPage
               rows={skuInventory}
+              filters={inventoryDetailFilters}
+              onFilterChange={setInventoryDetailFilters}
+              onFilterApply={setInventoryDetailFilters}
             />
           )}
           {activePage === "inventory-logs" && (
@@ -1194,6 +1200,57 @@ function ProductTable({
   );
 }
 
+function ProductFilterControls({
+  brands,
+  products,
+  filters,
+  onFilterChange,
+  onFilterApply,
+}: {
+  brands: FilterBrandOption[];
+  products: FilterProductOption[];
+  filters: SkuFilters;
+  onFilterChange: (filters: SkuFilters) => void;
+  onFilterApply: (filters: SkuFilters) => void;
+}) {
+  const productOptions = products.filter((product) => !filters.brandId || product.brandId === Number(filters.brandId));
+
+  function applyBrandFilter(value: string) {
+    const nextFilters: SkuFilters = { brandId: value ? Number(value) : "", productId: "" };
+    onFilterChange(nextFilters);
+    onFilterApply(nextFilters);
+  }
+
+  function applyProductFilter(value: string) {
+    const nextFilters: SkuFilters = { ...filters, productId: value ? Number(value) : "" };
+    onFilterChange(nextFilters);
+    onFilterApply(nextFilters);
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-3">
+      <Select
+        className="h-10 w-44"
+        value={String(filters.brandId || "")}
+        onChange={(event) => applyBrandFilter(event.target.value)}
+        onBlur={(event) => applyBrandFilter(event.currentTarget.value)}
+      >
+        <option value="">全部品牌</option>
+        {brands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
+      </Select>
+      <Select
+        className="h-10 w-44"
+        value={String(filters.productId || "")}
+        onChange={(event) => applyProductFilter(event.target.value)}
+        onBlur={(event) => applyProductFilter(event.currentTarget.value)}
+      >
+        <option value="">全部商品</option>
+        {productOptions.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
+      </Select>
+    </div>
+  );
+}
+
 function SkuTable({
   skus,
   brands,
@@ -1221,47 +1278,24 @@ function SkuTable({
 }) {
   const pagination = usePagination(skus);
   const brandOptions = brands.filter((brand) => !brand.isHidden);
-  const productOptions = products.filter((product) => !product.isHidden && (!filters.brandId || product.brandId === Number(filters.brandId)));
-
-  function applyBrandFilter(value: string) {
-    const nextFilters: SkuFilters = { brandId: value ? Number(value) : "", productId: "" };
-    onFilterChange(nextFilters);
-    onFilterApply(nextFilters);
-  }
-
-  function applyProductFilter(value: string) {
-    const nextFilters: SkuFilters = { ...filters, productId: value ? Number(value) : "" };
-    onFilterChange(nextFilters);
-    onFilterApply(nextFilters);
-  }
+  const productOptions = products.filter((product) => !product.isHidden);
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
       <div className="flex items-center justify-between border-b p-5">
         <h2 className="text-lg font-semibold text-slate-950">SKU 管理</h2>
-        <Button onClick={onAdd}>新增 SKU</Button>
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <ProductFilterControls
+            brands={brandOptions}
+            products={productOptions}
+            filters={filters}
+            onFilterChange={onFilterChange}
+            onFilterApply={onFilterApply}
+          />
+          <Button onClick={onAdd}>新增 SKU</Button>
+        </div>
       </div>
       <div className="overflow-auto p-5">
-        <div className="mb-4 flex flex-wrap items-center gap-3">
-          <Select
-            className="h-10 w-44"
-            value={String(filters.brandId || "")}
-            onChange={(event) => onFilterChange({ brandId: event.target.value ? Number(event.target.value) : "", productId: "" })}
-            onBlur={(event) => applyBrandFilter(event.currentTarget.value)}
-          >
-            <option value="">全部品牌</option>
-            {brandOptions.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
-          </Select>
-          <Select
-            className="h-10 w-44"
-            value={String(filters.productId || "")}
-            onChange={(event) => onFilterChange({ ...filters, productId: event.target.value ? Number(event.target.value) : "" })}
-            onBlur={(event) => applyProductFilter(event.currentTarget.value)}
-          >
-            <option value="">全部商品</option>
-            {productOptions.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
-          </Select>
-        </div>
         <table className={`${tableBase} min-w-[980px]`}>
           <thead>
             <tr>
@@ -1403,13 +1437,45 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
   );
 }
 
-function SkuInventoryPage({ rows }: { rows: SkuInventoryRow[] }) {
-  const pagination = usePagination(rows);
+function SkuInventoryPage({
+  rows,
+  filters,
+  onFilterChange,
+  onFilterApply,
+}: {
+  rows: SkuInventoryRow[];
+  filters: SkuFilters;
+  onFilterChange: (filters: SkuFilters) => void;
+  onFilterApply: (filters: SkuFilters) => void;
+}) {
+  const brandOptions = useMemo(
+    () => Array.from(new Map(rows.map((row) => [row.brandId, { id: row.brandId, name: row.brandName }])).values()),
+    [rows],
+  );
+  const productOptions = useMemo(
+    () => Array.from(new Map(rows.map((row) => [row.productId, { id: row.productId, brandId: row.brandId, name: row.productName }])).values()),
+    [rows],
+  );
+  const filteredRows = useMemo(
+    () => rows.filter((row) =>
+      (!filters.brandId || row.brandId === Number(filters.brandId)) &&
+      (!filters.productId || row.productId === Number(filters.productId)),
+    ),
+    [rows, filters],
+  );
+  const pagination = usePagination(filteredRows);
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="border-b p-5">
+      <div className="flex flex-wrap items-center justify-between gap-4 border-b p-5">
         <h2 className="text-lg font-semibold text-slate-950">库存明细</h2>
+        <ProductFilterControls
+          brands={brandOptions}
+          products={productOptions}
+          filters={filters}
+          onFilterChange={onFilterChange}
+          onFilterApply={onFilterApply}
+        />
       </div>
       <div className="overflow-auto p-5">
         <table className={`${tableBase} min-w-[900px]`}>
@@ -1933,6 +1999,38 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+function PasswordInput({
+  value,
+  onChange,
+  required,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  required?: boolean;
+}) {
+  const [visible, setVisible] = useState(false);
+  const Icon = visible ? EyeOff : Eye;
+
+  return (
+    <div className="relative">
+      <Input
+        type={visible ? "text" : "password"}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        required={required}
+        className="pr-10"
+      />
+      <button
+        type="button"
+        className="absolute right-2 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-800"
+        onClick={() => setVisible((current) => !current)}
+      >
+        <Icon className="h-4 w-4" />
+      </button>
+    </div>
+  );
+}
+
 function DefaultPlatformPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
   const options = [
     { value: "pinduoduo", label: "拼多多" },
@@ -2000,8 +2098,14 @@ function EditorDialog({
             <>
               <Field label="英文用户名"><Input value={form.username || ""} onChange={(event) => onChange("username", event.target.value)} required pattern="[A-Za-z][A-Za-z0-9_]{2,31}" /></Field>
               <Field label="真实姓名"><Input value={form.name || ""} onChange={(event) => onChange("name", event.target.value)} required /></Field>
-              <Field label={editingId ? "密码（留空则不修改）" : "密码"}><Input type="password" value={form.password || ""} onChange={(event) => onChange("password", event.target.value)} required={!editingId} /></Field>
-              <Field label="密码确认"><Input type="password" value={form.confirmPassword || ""} onChange={(event) => onChange("confirmPassword", event.target.value)} required={!editingId || Boolean(form.password)} /></Field>
+              {editingId ? (
+                <Field label="密码（留空则不修改）"><PasswordInput value={form.password || ""} onChange={(value) => onChange("password", value)} /></Field>
+              ) : (
+                <>
+                  <Field label="密码"><Input type="password" value={form.password || ""} onChange={(event) => onChange("password", event.target.value)} required /></Field>
+                  <Field label="密码确认"><Input type="password" value={form.confirmPassword || ""} onChange={(event) => onChange("confirmPassword", event.target.value)} required /></Field>
+                </>
+              )}
               <PermissionPicker value={form.permissions || []} onChange={(value) => onChange("permissions", value)} />
             </>
           )}
