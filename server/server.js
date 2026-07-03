@@ -100,17 +100,24 @@ function signToken(user, permissions) {
 }
 
 async function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!token) return res.status(401).json({ message: "请先登录" });
+
+  let payload;
   try {
-    const header = req.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!token) return res.status(401).json({ message: "请先登录" });
-    const payload = jwt.verify(token, jwtSecret);
+    payload = jwt.verify(token, jwtSecret);
+  } catch {
+    return res.status(401).json({ message: "登录已过期，请重新登录" });
+  }
+
+  try {
     const user = await findUserById(payload.userId);
     if (!user || user.status !== 1) return res.status(401).json({ message: "用户不存在或已停用" });
     req.user = { ...user, permissions: await getUserPermissions(user.id) };
     next();
-  } catch {
-    res.status(401).json({ message: "登录已过期，请重新登录" });
+  } catch (error) {
+    next(error);
   }
 }
 
