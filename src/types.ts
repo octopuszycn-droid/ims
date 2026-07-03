@@ -19,6 +19,7 @@ export type Brand = {
   id: number;
   name: string;
   remark: string;
+  defaultPlatform: "douyin" | "pinduoduo" | "";
   sortOrder: number;
   isHidden: 0 | 1;
 };

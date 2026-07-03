@@ -27,6 +27,7 @@ await ensureSchema();
 
 async function ensureSchema() {
   await query("alter table brands add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
+  await query("alter table brands add column if not exists default_platform tinyint unsigned null comment '默认平台：1抖音，2拼多多，为空表示未选择' after remark");
   await query("alter table products add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
   await query("alter table skus add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
   await query("alter table inventory_operation_logs add column if not exists platform tinyint unsigned null comment '平台：1抖音，2拼多多，为空表示未选择' after stock_label");
@@ -301,7 +302,9 @@ app.get("/api/brands", requireAuth, readScope, async (req, res, next) => {
     const includeHidden = req.query.includeHidden === "1";
     res.json(
       await query(
-        `select id, name, remark, sort_order as sortOrder, is_hidden as isHidden
+        `select id, name, remark,
+          case default_platform when 1 then 'douyin' when 2 then 'pinduoduo' else '' end as defaultPlatform,
+          sort_order as sortOrder, is_hidden as isHidden
          from brands
          where deleted_at is null and (? = 1 or is_hidden = 0)
          order by is_hidden, sort_order, id`,
@@ -316,9 +319,10 @@ app.get("/api/brands", requireAuth, readScope, async (req, res, next) => {
 app.post("/api/brands", requireAuth, requireSuper, async (req, res, next) => {
   try {
     const [{ maxSort }] = await query("select coalesce(max(sort_order), 0) + 10 as maxSort from brands");
-    const result = await query("insert into brands(name, remark, sort_order) values(?, ?, ?)", [
+    const result = await query("insert into brands(name, remark, default_platform, sort_order) values(?, ?, ?, ?)", [
       assertName(req.body.name, "品牌名"),
       String(req.body.remark || "").trim(),
+      normalizePlatform(req.body.defaultPlatform),
       maxSort,
     ]);
     res.status(201).json({ id: result.insertId });
@@ -329,9 +333,10 @@ app.post("/api/brands", requireAuth, requireSuper, async (req, res, next) => {
 
 app.put("/api/brands/:id", requireAuth, requireSuper, async (req, res, next) => {
   try {
-    await query("update brands set name = ?, remark = ? where id = ?", [
+    await query("update brands set name = ?, remark = ?, default_platform = ? where id = ?", [
       assertName(req.body.name, "品牌名"),
       String(req.body.remark || "").trim(),
+      normalizePlatform(req.body.defaultPlatform),
       Number(req.params.id),
     ]);
     res.json({ ok: true });
@@ -443,6 +448,7 @@ app.patch("/api/products/:id/hidden", requireAuth, requireSuper, async (req, res
 app.get("/api/skus", requireAuth, readScope, async (req, res, next) => {
   try {
     const productId = Number(req.query.productId || 0);
+    const brandId = Number(req.query.brandId || 0);
     const includeHidden = req.query.includeHidden === "1";
     res.json(
       await query(
@@ -453,9 +459,10 @@ app.get("/api/skus", requireAuth, readScope, async (req, res, next) => {
          join brands b on b.id = p.brand_id
          where s.deleted_at is null and p.deleted_at is null and b.deleted_at is null
            and (? = 0 or s.product_id = ?)
+           and (? = 0 or b.id = ?)
            and (? = 1 or (s.is_hidden = 0 and p.is_hidden = 0 and b.is_hidden = 0))
          order by b.is_hidden, b.sort_order, b.id, p.is_hidden, p.sort_order, p.id, s.is_hidden, s.sort_order, s.id`,
-        [productId, productId, includeHidden ? 1 : 0],
+        [productId, productId, brandId, brandId, includeHidden ? 1 : 0],
       ),
     );
   } catch (error) {

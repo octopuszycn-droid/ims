@@ -96,9 +96,10 @@ export const api = {
   setProductHidden(token: string, id: number, isHidden: boolean) {
     return request("/api/products/" + id + "/hidden", { method: "PATCH", token, body: JSON.stringify({ isHidden }) });
   },
-  skus(token: string, productId?: number, includeHidden = false) {
+  skus(token: string, productId?: number, includeHidden = false, brandId?: number) {
     const params = new URLSearchParams();
     if (productId) params.set("productId", String(productId));
+    if (brandId) params.set("brandId", String(brandId));
     if (includeHidden) params.set("includeHidden", "1");
     return request<Sku[]>(params.size ? `/api/skus?${params.toString()}` : "/api/skus", { token });
   },

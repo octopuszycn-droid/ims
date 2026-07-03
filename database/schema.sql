@@ -40,6 +40,7 @@ create table if not exists `brands` (
   `id` bigint unsigned not null auto_increment comment '品牌ID',
   `name` varchar(30) not null comment '品牌名，最多15个汉字',
   `remark` varchar(255) not null default '' comment '备注',
+  `default_platform` tinyint unsigned null comment '默认平台：1抖音，2拼多多，为空表示未选择',
   `sort_order` int not null default 0 comment '排序值，升序',
   `is_hidden` tinyint unsigned not null default 0 comment '是否隐藏：0否，1是',
   `created_at` datetime not null default current_timestamp comment '创建时间',
@@ -132,6 +133,7 @@ alter table `users` modify column `username` varchar(64) not null comment '英�
 create unique index if not exists `uk_users_username` on `users` (`username`);
 
 alter table `brands` add column if not exists `is_hidden` tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after `sort_order`;
+alter table `brands` add column if not exists `default_platform` tinyint unsigned null comment '默认平台：1抖音，2拼多多，为空表示未选择' after `remark`;
 alter table `products` add column if not exists `is_hidden` tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after `sort_order`;
 alter table `skus` add column if not exists `is_hidden` tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after `sort_order`;
 alter table `sku_inventory` drop constraint if exists `chk_sku_inventory_qty`;

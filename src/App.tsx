@@ -60,6 +60,7 @@ type PageKey =
 
 type DialogType = null | "user" | "brand" | "product" | "sku" | "inbound" | "outbound";
 type LogFilters = { startAt: string; endAt: string };
+type SkuFilters = { brandId: number | ""; productId: number | "" };
 
 type NavGroup = {
   label: string;
@@ -198,6 +199,7 @@ export function App() {
   const [logTotal, setLogTotal] = useState(0);
   const [logFilters, setLogFilters] = useState<LogFilters>({ startAt: "", endAt: "" });
   const [logFilterDraft, setLogFilterDraft] = useState<LogFilters>({ startAt: "", endAt: "" });
+  const [skuFilters, setSkuFilters] = useState<SkuFilters>({ brandId: "", productId: "" });
   const [dialog, setDialog] = useState<DialogType>(null);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<Record<string, any>>({});
@@ -308,6 +310,22 @@ export function App() {
     }
   }
 
+  async function loadSkuList(filters = skuFilters, activeSession = session) {
+    if (!activeSession) return;
+    setError("");
+    try {
+      const rows = await api.skus(
+        activeSession.token,
+        filters.productId ? Number(filters.productId) : undefined,
+        activeSession.permissions.includes("SUPER"),
+        filters.brandId ? Number(filters.brandId) : undefined,
+      );
+      setSkus(rows);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "SKU 加载失败");
+    }
+  }
+
   async function handleLogin(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setMessage("");
@@ -385,7 +403,7 @@ export function App() {
 
   function openBrand(brand?: Brand) {
     setEditingId(brand?.id ?? null);
-    setForm(brand ? { name: brand.name, remark: brand.remark } : { name: "", remark: "" });
+    setForm(brand ? { name: brand.name, remark: brand.remark, defaultPlatform: brand.defaultPlatform || "" } : { name: "", remark: "", defaultPlatform: "" });
     setDialog("brand");
   }
 
@@ -424,7 +442,7 @@ export function App() {
       label: "salable",
       inboundType: "return",
       simultaneousInbound: false,
-      platform: "",
+      platform: firstVisibleBrand?.defaultPlatform || "",
       remark: "",
     });
     setDialog(type);
@@ -451,7 +469,7 @@ export function App() {
         else await api.createUser(token, payload);
       }
       if (dialog === "brand") {
-        const payload = { name: String(form.name || "").trim(), remark: String(form.remark || "").trim() };
+        const payload = { name: String(form.name || "").trim(), remark: String(form.remark || "").trim(), defaultPlatform: form.defaultPlatform || "" };
         if (editingId) await api.updateBrand(token, editingId, payload);
         else await api.createBrand(token, payload);
       }
@@ -648,7 +666,19 @@ export function App() {
             <ProductTable products={products} onAdd={() => void openProduct()} onEdit={(product) => void openProduct(product)} onToggleHidden={(product) => toggleHidden("product", product)} onDragStart={setDragId} onDrop={(id) => reorder("product", products, id)} />
           )}
           {activePage === "sku-list" && (
-            <SkuTable skus={skus} onAdd={() => void openSku()} onEdit={(sku) => void openSku(sku)} onToggleHidden={(sku) => toggleHidden("sku", sku)} onDragStart={setDragId} onDrop={(id) => reorder("sku", skus, id)} />
+            <SkuTable
+              skus={skus}
+              brands={brands}
+              products={products}
+              filters={skuFilters}
+              onFilterChange={setSkuFilters}
+              onFilterApply={(filters) => void loadSkuList(filters)}
+              onAdd={() => void openSku()}
+              onEdit={(sku) => void openSku(sku)}
+              onToggleHidden={(sku) => toggleHidden("sku", sku)}
+              onDragStart={setDragId}
+              onDrop={(id) => reorder("sku", skus, id)}
+            />
           )}
           {activePage === "inventory-summary" && <ProductInventoryTable rows={productInventory} />}
           {activePage === "inventory-detail" && (
@@ -700,6 +730,10 @@ export function App() {
             patchForm("productId", "");
             patchForm("skuId", "");
             setCurrentStock(null);
+            if (dialog === "inbound" || dialog === "outbound") {
+              const selectedBrand = brands.find((brand) => brand.id === brandId);
+              patchForm("platform", selectedBrand?.defaultPlatform || "");
+            }
             await loadModalProducts(brandId, undefined, shouldAutoPick);
           }}
           onProductChange={async (productId) => {
@@ -876,7 +910,7 @@ function DateRangePicker2({
       <button
         type="button"
         onClick={() => setOpen((current) => !current)}
-        className="flex h-9 w-[260px] items-center justify-between rounded-lg border border-slate-200 bg-white px-3 text-left text-sm text-slate-700 shadow-sm hover:bg-slate-50"
+        className="flex h-10 w-[260px] items-center justify-between rounded-lg border border-slate-200 bg-white px-3 text-left text-sm text-slate-700 shadow-sm hover:bg-slate-50"
       >
         <span className={["truncate", hasValue ? "text-slate-800" : "text-slate-400"].join(" ")}>{label}</span>
         {hasValue && (
@@ -912,7 +946,7 @@ function DateRangePicker2({
                 type="date"
                 value={filters.startAt}
                 onChange={(event) => onChange({ ...filters, startAt: event.target.value })}
-                className="h-9"
+                className="h-10"
               />
             </label>
             <label className="flex items-center gap-3 text-sm text-slate-600">
@@ -921,7 +955,7 @@ function DateRangePicker2({
                 type="date"
                 value={filters.endAt}
                 onChange={(event) => onChange({ ...filters, endAt: event.target.value })}
-                className="h-9"
+                className="h-10"
               />
             </label>
           </div>
@@ -1053,11 +1087,12 @@ function BrandTable({
         <Button onClick={onAdd}>新增品牌</Button>
       </div>
       <div className="overflow-auto p-5">
-        <table className={`${tableBase} min-w-[720px]`}>
+        <table className={`${tableBase} min-w-[760px]`}>
           <thead>
             <tr>
               <th className={thBase}>品牌名</th>
-              <th className={thBase}>备注</th>
+              <th className={`${thBase} w-[140px]`}>默认平台</th>
+              <th className={`${thBase} w-[260px]`}>备注</th>
               <th className={actionTh}>操作</th>
               <th className={dragTh}></th>
             </tr>
@@ -1073,7 +1108,8 @@ function BrandTable({
                 className={["cursor-move", brand.isHidden ? "text-slate-400" : ""].join(" ")}
               >
                 <td className={tdBase}>{brand.name}</td>
-                <td className={tdBase}>{brand.remark || "-"}</td>
+                <td className={`${tdBase} w-[140px]`}>{platformLabel(brand.defaultPlatform) || "-"}</td>
+                <td className={`${tdBase} max-w-[260px] truncate`}>{brand.remark || "-"}</td>
                 <td className={actionTd}>
                   <div className="flex whitespace-nowrap gap-3">
                     <ActionLink onClick={() => onEdit(brand)}>修改</ActionLink>
@@ -1160,6 +1196,11 @@ function ProductTable({
 
 function SkuTable({
   skus,
+  brands,
+  products,
+  filters,
+  onFilterChange,
+  onFilterApply,
   onAdd,
   onEdit,
   onToggleHidden,
@@ -1167,6 +1208,11 @@ function SkuTable({
   onDrop,
 }: {
   skus: Sku[];
+  brands: Brand[];
+  products: Product[];
+  filters: SkuFilters;
+  onFilterChange: (filters: SkuFilters) => void;
+  onFilterApply: (filters: SkuFilters) => void;
   onAdd: () => void;
   onEdit: (sku: Sku) => void;
   onToggleHidden: (sku: Sku) => void;
@@ -1174,6 +1220,20 @@ function SkuTable({
   onDrop: (id: number) => void;
 }) {
   const pagination = usePagination(skus);
+  const brandOptions = brands.filter((brand) => !brand.isHidden);
+  const productOptions = products.filter((product) => !product.isHidden && (!filters.brandId || product.brandId === Number(filters.brandId)));
+
+  function applyBrandFilter(value: string) {
+    const nextFilters: SkuFilters = { brandId: value ? Number(value) : "", productId: "" };
+    onFilterChange(nextFilters);
+    onFilterApply(nextFilters);
+  }
+
+  function applyProductFilter(value: string) {
+    const nextFilters: SkuFilters = { ...filters, productId: value ? Number(value) : "" };
+    onFilterChange(nextFilters);
+    onFilterApply(nextFilters);
+  }
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
@@ -1182,6 +1242,26 @@ function SkuTable({
         <Button onClick={onAdd}>新增 SKU</Button>
       </div>
       <div className="overflow-auto p-5">
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          <Select
+            className="h-10 w-44"
+            value={String(filters.brandId || "")}
+            onChange={(event) => onFilterChange({ brandId: event.target.value ? Number(event.target.value) : "", productId: "" })}
+            onBlur={(event) => applyBrandFilter(event.currentTarget.value)}
+          >
+            <option value="">全部品牌</option>
+            {brandOptions.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
+          </Select>
+          <Select
+            className="h-10 w-44"
+            value={String(filters.productId || "")}
+            onChange={(event) => onFilterChange({ ...filters, productId: event.target.value ? Number(event.target.value) : "" })}
+            onBlur={(event) => applyProductFilter(event.currentTarget.value)}
+          >
+            <option value="">全部商品</option>
+            {productOptions.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
+          </Select>
+        </div>
         <table className={`${tableBase} min-w-[980px]`}>
           <thead>
             <tr>
@@ -1853,6 +1933,28 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+function DefaultPlatformPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const options = [
+    { value: "pinduoduo", label: "拼多多" },
+    { value: "douyin", label: "抖音" },
+  ];
+
+  return (
+    <div className="flex flex-wrap items-center gap-4">
+      {options.map((option) => (
+        <label key={option.value} className="inline-flex items-center gap-1.5 text-sm text-slate-700">
+          <input
+            type="radio"
+            name="defaultPlatform"
+            checked={value === option.value}
+            onChange={() => onChange(value === option.value ? "" : option.value)}
+          />
+          {option.label}
+        </label>
+      ))}
+    </div>
+  );
+}
 function EditorDialog({
   dialog,
   editingId,
@@ -1906,6 +2008,7 @@ function EditorDialog({
           {dialog === "brand" && (
             <>
               <Field label="品牌名"><Input value={form.name || ""} onChange={(event) => onChange("name", event.target.value)} required maxLength={15} /></Field>
+              <Field label="默认平台"><DefaultPlatformPicker value={form.defaultPlatform || ""} onChange={(value) => onChange("defaultPlatform", value)} /></Field>
               <Field label="备注"><Input value={form.remark || ""} onChange={(event) => onChange("remark", event.target.value)} /></Field>
             </>
           )}
