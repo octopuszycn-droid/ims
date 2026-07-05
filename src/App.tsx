@@ -770,7 +770,7 @@ export function App() {
               canWrite={session.permissions.includes("SUPER") || session.permissions.includes("INVENTORY")}
               onPageChange={(nextPage) => void loadLogPage(nextPage)}
               onFilterChange={setLogFilterDraft}
-              onSearch={() => void loadLogPage(1, session, logFilterDraft)}
+              onFilterApply={(nextFilters) => void loadLogPage(1, session, nextFilters)}
               onExport={() => void exportInventoryLogs()}
               onReset={() => {
                 setLogFilterDraft(emptyLogFilters);
@@ -1653,7 +1653,7 @@ function LogTable({
   canWrite,
   onPageChange,
   onFilterChange,
-  onSearch,
+  onFilterApply,
   onExport,
   onReset,
   onInbound,
@@ -1667,7 +1667,7 @@ function LogTable({
   canWrite: boolean;
   onPageChange: (page: number) => void;
   onFilterChange: (filters: InventoryLogFilters) => void;
-  onSearch: () => void;
+  onFilterApply: (filters: InventoryLogFilters) => void;
   onExport: () => void;
   onReset: () => void;
   onInbound: () => void;
@@ -1691,7 +1691,9 @@ function LogTable({
   }, [catalogRows, filters.brandId]);
 
   function patchFilters(patch: Partial<InventoryLogFilters>) {
-    onFilterChange({ ...filters, ...patch });
+    const nextFilters = { ...filters, ...patch };
+    onFilterChange(nextFilters);
+    onFilterApply(nextFilters);
   }
 
   return (
@@ -1713,58 +1715,57 @@ function LogTable({
             onClear={onReset}
           />
           <Select
-            className="h-10 w-28"
+            className={["h-10 w-28", filters.operationType ? "" : "text-slate-400"].join(" ")}
             value={filters.operationType}
             onChange={(event) => patchFilters({ operationType: event.target.value as InventoryLogFilters["operationType"] })}
           >
-            <option value="">全部类型</option>
-            <option value="1">入库</option>
-            <option value="2">出库</option>
+            <option className="text-slate-400" value="">全部类型</option>
+            <option className="text-slate-800" value="1">入库</option>
+            <option className="text-slate-800" value="2">出库</option>
           </Select>
           <Select
-            className="h-10 w-36"
+            className={["h-10 w-36", filters.brandId ? "" : "text-slate-400"].join(" ")}
             value={String(filters.brandId || "")}
             onChange={(event) => patchFilters({ brandId: event.target.value ? Number(event.target.value) : "", productId: "" })}
           >
-            <option value="">全部品牌</option>
-            {brandOptions.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
+            <option className="text-slate-400" value="">全部品牌</option>
+            {brandOptions.map((brand) => <option className="text-slate-800" key={brand.id} value={brand.id}>{brand.name}</option>)}
           </Select>
           <Select
-            className="h-10 w-36"
+            className={["h-10 w-36", filters.productId ? "" : "text-slate-400"].join(" ")}
             value={String(filters.productId || "")}
             onChange={(event) => patchFilters({ productId: event.target.value ? Number(event.target.value) : "" })}
           >
-            <option value="">全部商品</option>
-            {productOptions.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
+            <option className="text-slate-400" value="">全部商品</option>
+            {productOptions.map((product) => <option className="text-slate-800" key={product.id} value={product.id}>{product.name}</option>)}
           </Select>
           <Select
-            className="h-10 w-28"
+            className={["h-10 w-28", filters.inboundType ? "" : "text-slate-400"].join(" ")}
             value={filters.inboundType}
             onChange={(event) => patchFilters({ inboundType: event.target.value as InventoryLogFilters["inboundType"] })}
           >
-            <option value="">入库类型</option>
-            <option value="1">新货</option>
-            <option value="2">退货</option>
+            <option className="text-slate-400" value="">全部入库类型</option>
+            <option className="text-slate-800" value="1">新货</option>
+            <option className="text-slate-800" value="2">退货</option>
           </Select>
           <Select
-            className="h-10 w-28"
+            className={["h-10 w-28", filters.stockLabel ? "" : "text-slate-400"].join(" ")}
             value={filters.stockLabel}
             onChange={(event) => patchFilters({ stockLabel: event.target.value as InventoryLogFilters["stockLabel"] })}
           >
-            <option value="">全部标签</option>
-            <option value="1">可售</option>
-            <option value="2">不可售</option>
+            <option className="text-slate-400" value="">全部标签</option>
+            <option className="text-slate-800" value="1">可售</option>
+            <option className="text-slate-800" value="2">不可售</option>
           </Select>
           <Select
-            className="h-10 w-28"
+            className={["h-10 w-28", filters.platform ? "" : "text-slate-400"].join(" ")}
             value={filters.platform}
             onChange={(event) => patchFilters({ platform: event.target.value as InventoryLogFilters["platform"] })}
           >
-            <option value="">全部平台</option>
-            <option value="douyin">抖音</option>
-            <option value="pinduoduo">拼多多</option>
+            <option className="text-slate-400" value="">全部平台</option>
+            <option className="text-slate-800" value="douyin">抖音</option>
+            <option className="text-slate-800" value="pinduoduo">拼多多</option>
           </Select>
-          <Button variant="secondary" onClick={onSearch}>查询</Button>
           <Button onClick={onExport}>导出</Button>
         </div>
       </div>
