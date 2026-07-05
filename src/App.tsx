@@ -1,10 +1,11 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { EChartsOption } from "echarts";
-import { Eye, EyeOff, GripVertical, Loader2, Minus, Plus, X } from "lucide-react";
+import { Eye, EyeOff, GripVertical, Loader2, Minus, PencilLine, Plus, X } from "lucide-react";
 import { ApiError, api } from "./api";
 import type {
   Brand,
   InventoryLog,
+  InventoryLogFilters,
   PermissionCode,
   Product,
   ProductInventoryRow,
@@ -29,6 +30,7 @@ const serverExpiryDate = "2027-06-01";
 const serverExpiryAt = new Date(`${serverExpiryDate}T00:00:00+08:00`).getTime();
 const serverExpiryWarningDays = 10;
 const dayMs = 24 * 60 * 60 * 1000;
+const emptyLogFilters: InventoryLogFilters = { startAt: "", endAt: "", operationType: "", brandId: "", productId: "", inboundType: "", stockLabel: "", platform: "" };
 const tableBase = "w-full border-collapse text-left text-sm";
 const thBase = "border border-slate-200 bg-slate-50 px-4 py-2 text-left font-medium text-slate-600";
 const tdBase = "border border-slate-200 px-4 py-2 align-middle";
@@ -59,7 +61,6 @@ type PageKey =
   | "sales-amount";
 
 type DialogType = null | "user" | "brand" | "product" | "sku" | "inbound" | "outbound";
-type LogFilters = { startAt: string; endAt: string };
 type SkuFilters = { brandId: number | ""; productId: number | "" };
 type FilterBrandOption = { id: number; name: string };
 type FilterProductOption = { id: number; brandId: number; name: string };
@@ -200,8 +201,8 @@ export function App() {
   const [logs, setLogs] = useState<InventoryLog[]>([]);
   const [logPage, setLogPage] = useState(1);
   const [logTotal, setLogTotal] = useState(0);
-  const [logFilters, setLogFilters] = useState<LogFilters>({ startAt: "", endAt: "" });
-  const [logFilterDraft, setLogFilterDraft] = useState<LogFilters>({ startAt: "", endAt: "" });
+  const [logFilters, setLogFilters] = useState<InventoryLogFilters>(emptyLogFilters);
+  const [logFilterDraft, setLogFilterDraft] = useState<InventoryLogFilters>(emptyLogFilters);
   const [skuFilters, setSkuFilters] = useState<SkuFilters>({ brandId: "", productId: "" });
   const [inventoryDetailFilters, setInventoryDetailFilters] = useState<SkuFilters>({ brandId: "", productId: "" });
   const [dialog, setDialog] = useState<DialogType>(null);
@@ -212,6 +213,7 @@ export function App() {
   const [dragId, setDragId] = useState<number | null>(null);
   const [sqlPreview, setSqlPreview] = useState("");
   const [currentStock, setCurrentStock] = useState<{ salableQty: number; unsalableQty: number } | null>(null);
+  const [unsalableAdjust, setUnsalableAdjust] = useState<{ row: SkuInventoryRow; quantity: number; addToSalable: boolean } | null>(null);
   const serverExpiryDaysLeft = getServerExpiryDaysLeft();
   const isServerExpiryUrgent = serverExpiryDaysLeft < serverExpiryWarningDays;
 
@@ -270,7 +272,7 @@ export function App() {
     if (session) void refreshData(session);
   }, []);
 
-  async function refreshData(activeSession = session, nextLogPage = 1, nextLogFilters = logFilters) {
+  async function refreshData(activeSession = session, nextLogPage = 1, nextLogFilters: InventoryLogFilters = logFilters) {
     if (!activeSession) return;
     setIsLoading(true);
     setError("");
@@ -304,7 +306,7 @@ export function App() {
     }
   }
 
-  async function loadLogPage(nextPage: number, activeSession = session, nextLogFilters = logFilters) {
+  async function loadLogPage(nextPage: number, activeSession = session, nextLogFilters: InventoryLogFilters = logFilters) {
     if (!activeSession) return;
     setError("");
     try {
@@ -509,9 +511,9 @@ export function App() {
         const payload = {
           skuId: Number(form.skuId),
           quantity: Number(form.quantity),
-          label: form.label,
+          label: dialog === "outbound" ? "salable" : form.label,
           inboundType: form.inboundType,
-          simultaneousInbound: Boolean(form.simultaneousInbound),
+          simultaneousInbound: dialog === "outbound" ? false : Boolean(form.simultaneousInbound),
           platform: form.platform || "",
           remark: String(form.remark || "").trim(),
         };
@@ -578,6 +580,60 @@ export function App() {
     }
   }
 
+  async function exportInventoryDetail() {
+    if (!session) return;
+    setError("");
+    try {
+      const blob = await api.exportInventoryDetail(session.token);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `库存明细-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "导出失败");
+    }
+  }
+
+  async function exportInventoryLogs() {
+    if (!session) return;
+    setError("");
+    try {
+      const blob = await api.exportInventoryLogs(session.token, logFilterDraft);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `库存操作-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "导出失败");
+    }
+  }
+
+  async function submitUnsalableAdjust(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session || !unsalableAdjust) return;
+    setError("");
+    setNotice("");
+    try {
+      await api.adjustUnsalable(session.token, unsalableAdjust.row.skuId, {
+        quantity: unsalableAdjust.quantity,
+        addToSalable: unsalableAdjust.addToSalable,
+      });
+      setUnsalableAdjust(null);
+      setNotice("操作成功");
+      await refreshData(session);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "操作失败");
+    }
+  }
+
   async function importExcel(file: File) {
     if (!session) return;
     setError("");
@@ -622,7 +678,7 @@ export function App() {
             <span className={["text-sm font-medium", isServerExpiryUrgent ? "text-red-600" : "text-slate-500"].join(" ")}>
               距离服务器到期还有 {serverExpiryDaysLeft} 天
             </span>
-            {session.permissions.includes("SUPER") && (
+            {false && (
               <div className="flex gap-2">
                 <button
                   type="button"
@@ -699,6 +755,9 @@ export function App() {
               filters={inventoryDetailFilters}
               onFilterChange={setInventoryDetailFilters}
               onFilterApply={setInventoryDetailFilters}
+              canWrite={session.permissions.includes("SUPER") || session.permissions.includes("INVENTORY")}
+              onAdjust={(row) => setUnsalableAdjust({ row, quantity: 1, addToSalable: false })}
+              onExport={() => void exportInventoryDetail()}
             />
           )}
           {activePage === "inventory-logs" && (
@@ -707,14 +766,15 @@ export function App() {
               page={logPage}
               total={logTotal}
               filters={logFilterDraft}
+              catalogRows={skuInventory}
               canWrite={session.permissions.includes("SUPER") || session.permissions.includes("INVENTORY")}
               onPageChange={(nextPage) => void loadLogPage(nextPage)}
               onFilterChange={setLogFilterDraft}
               onSearch={() => void loadLogPage(1, session, logFilterDraft)}
+              onExport={() => void exportInventoryLogs()}
               onReset={() => {
-                const emptyFilters = { startAt: "", endAt: "" };
-                setLogFilterDraft(emptyFilters);
-                void loadLogPage(1, session, emptyFilters);
+                setLogFilterDraft(emptyLogFilters);
+                void loadLogPage(1, session, emptyLogFilters);
               }}
               onInbound={() => void openStockDialog("inbound")}
               onOutbound={() => void openStockDialog("outbound")}
@@ -761,6 +821,46 @@ export function App() {
           onClose={() => setDialog(null)}
           onSubmit={submitDialog}
         />
+      )}
+      {unsalableAdjust && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
+          <form onSubmit={submitUnsalableAdjust} className="w-full max-w-md rounded-lg bg-white p-5 shadow-xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-lg font-semibold">修改不可售库存</h3>
+              <Button variant="ghost" size="sm" onClick={() => setUnsalableAdjust(null)}>关闭</Button>
+            </div>
+            <div className="grid gap-3">
+              <Field label="不可售数">
+                <div className="flex items-center gap-2">
+                  <span className="text-base font-medium text-slate-700">-</span>
+                  <Input
+                    type="number"
+                    min="1"
+                    max={Number(unsalableAdjust.row.unsalableQty)}
+                    step="1"
+                    value={unsalableAdjust.quantity}
+                    onChange={(event) => setUnsalableAdjust((current) => current ? { ...current, quantity: Number(event.target.value) } : current)}
+                    required
+                  />
+                </div>
+              </Field>
+              <Field label="选择">
+                <label className="flex items-center gap-2 text-sm font-normal text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={unsalableAdjust.addToSalable}
+                    onChange={(event) => setUnsalableAdjust((current) => current ? { ...current, addToSalable: event.target.checked } : current)}
+                  />
+                  同时加回可售库中
+                </label>
+              </Field>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <Button variant="secondary" onClick={() => setUnsalableAdjust(null)}>取消</Button>
+              <Button type="submit">确定</Button>
+            </div>
+          </form>
+        </div>
       )}
       {sqlPreview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
@@ -827,8 +927,8 @@ function DateRangePicker({
   onChange,
   onClear,
 }: {
-  filters: LogFilters;
-  onChange: (filters: LogFilters) => void;
+  filters: Pick<InventoryLogFilters, "startAt" | "endAt">;
+  onChange: (filters: Pick<InventoryLogFilters, "startAt" | "endAt">) => void;
   onClear: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -902,8 +1002,8 @@ function DateRangePicker2({
   onChange,
   onClear,
 }: {
-  filters: LogFilters;
-  onChange: (filters: LogFilters) => void;
+  filters: Pick<InventoryLogFilters, "startAt" | "endAt">;
+  onChange: (filters: Pick<InventoryLogFilters, "startAt" | "endAt">) => void;
   onClear: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -1451,11 +1551,17 @@ function SkuInventoryPage({
   filters,
   onFilterChange,
   onFilterApply,
+  canWrite,
+  onAdjust,
+  onExport,
 }: {
   rows: SkuInventoryRow[];
   filters: SkuFilters;
   onFilterChange: (filters: SkuFilters) => void;
   onFilterApply: (filters: SkuFilters) => void;
+  canWrite: boolean;
+  onAdjust: (row: SkuInventoryRow) => void;
+  onExport: () => void;
 }) {
   const brandOptions = useMemo(
     () => Array.from(new Map(rows.map((row) => [row.brandId, { id: row.brandId, name: row.brandName }])).values()),
@@ -1478,13 +1584,16 @@ function SkuInventoryPage({
     <section className="rounded-lg border bg-white shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-4 border-b p-5">
         <h2 className="text-lg font-semibold text-slate-950">库存明细</h2>
-        <ProductFilterControls
-          brands={brandOptions}
-          products={productOptions}
-          filters={filters}
-          onFilterChange={onFilterChange}
-          onFilterApply={onFilterApply}
-        />
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <ProductFilterControls
+            brands={brandOptions}
+            products={productOptions}
+            filters={filters}
+            onFilterChange={onFilterChange}
+            onFilterApply={onFilterApply}
+          />
+          <Button onClick={onExport}>导出</Button>
+        </div>
       </div>
       <div className="overflow-auto p-5">
         <table className={`${tableBase} min-w-[900px]`}>
@@ -1510,7 +1619,20 @@ function SkuInventoryPage({
                   <td className={tdBase}>{row.skuName}</td>
                   <td className={tdBase}>{salable + Number(row.unsalableQty)}</td>
                   <td className={[tdBase, salable === 0 ? "bg-red-100 font-semibold text-red-700" : salable === 1 ? "bg-amber-100 font-semibold text-amber-700" : ""].join(" ")}>{salable}</td>
-                  <td className={tdBase}>{row.unsalableQty}</td>
+                  <td className={tdBase}>
+                    <span className="inline-flex items-center gap-2">
+                      {row.unsalableQty}
+                      {canWrite && Number(row.unsalableQty) > 0 && (
+                        <button
+                          type="button"
+                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-50"
+                          onClick={() => onAdjust(row)}
+                        >
+                          <PencilLine className="h-4 w-4" />
+                        </button>
+                      )}
+                    </span>
+                  </td>
                 </tr>
               );
             })}
@@ -1527,10 +1649,12 @@ function LogTable({
   page,
   total,
   filters,
+  catalogRows,
   canWrite,
   onPageChange,
   onFilterChange,
   onSearch,
+  onExport,
   onReset,
   onInbound,
   onOutbound,
@@ -1538,11 +1662,13 @@ function LogTable({
   logs: InventoryLog[];
   page: number;
   total: number;
-  filters: LogFilters;
+  filters: InventoryLogFilters;
+  catalogRows: SkuInventoryRow[];
   canWrite: boolean;
   onPageChange: (page: number) => void;
-  onFilterChange: (filters: LogFilters) => void;
+  onFilterChange: (filters: InventoryLogFilters) => void;
   onSearch: () => void;
+  onExport: () => void;
   onReset: () => void;
   onInbound: () => void;
   onOutbound: () => void;
@@ -1550,22 +1676,96 @@ function LogTable({
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const start = total ? (page - 1) * pageSize + 1 : 0;
   const end = Math.min(total, (page - 1) * pageSize + logs.length);
+  const brandOptions = useMemo(() => {
+    const map = new Map<number, string>();
+    for (const row of catalogRows) map.set(row.brandId, row.brandName);
+    return [...map.entries()].map(([id, name]) => ({ id, name }));
+  }, [catalogRows]);
+  const productOptions = useMemo(() => {
+    const map = new Map<number, { id: number; brandId: number; name: string }>();
+    for (const row of catalogRows) {
+      if (filters.brandId && row.brandId !== Number(filters.brandId)) continue;
+      map.set(row.productId, { id: row.productId, brandId: row.brandId, name: row.productName });
+    }
+    return [...map.values()];
+  }, [catalogRows, filters.brandId]);
+
+  function patchFilters(patch: Partial<InventoryLogFilters>) {
+    onFilterChange({ ...filters, ...patch });
+  }
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
       <div className="flex items-center justify-between border-b p-5">
         <h2 className="text-lg font-semibold text-slate-950">库存操作</h2>
-        <div className="flex flex-wrap items-center justify-end gap-x-8 gap-y-2">
+        {canWrite && (
           <div className="flex items-center gap-2">
-            <DateRangePicker2 filters={filters} onChange={onFilterChange} onClear={onReset} />
-            <Button size="sm" variant="secondary" onClick={onSearch}>查询</Button>
+            <Button onClick={onOutbound}>出库</Button>
+            <Button onClick={onInbound}>入库</Button>
           </div>
-          {canWrite && (
-            <div className="flex items-center gap-2">
-              <Button onClick={onOutbound}>出库</Button>
-              <Button onClick={onInbound}>入库</Button>
-            </div>
-          )}
+        )}
+      </div>
+      <div className="border-b bg-slate-50/60 p-5">
+        <div className="flex flex-wrap items-center gap-3">
+          <DateRangePicker2
+            filters={filters}
+            onChange={(next) => patchFilters({ startAt: next.startAt, endAt: next.endAt })}
+            onClear={onReset}
+          />
+          <Select
+            className="h-10 w-28"
+            value={filters.operationType}
+            onChange={(event) => patchFilters({ operationType: event.target.value as InventoryLogFilters["operationType"] })}
+          >
+            <option value="">全部类型</option>
+            <option value="1">入库</option>
+            <option value="2">出库</option>
+          </Select>
+          <Select
+            className="h-10 w-36"
+            value={String(filters.brandId || "")}
+            onChange={(event) => patchFilters({ brandId: event.target.value ? Number(event.target.value) : "", productId: "" })}
+          >
+            <option value="">全部品牌</option>
+            {brandOptions.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
+          </Select>
+          <Select
+            className="h-10 w-36"
+            value={String(filters.productId || "")}
+            onChange={(event) => patchFilters({ productId: event.target.value ? Number(event.target.value) : "" })}
+          >
+            <option value="">全部商品</option>
+            {productOptions.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
+          </Select>
+          <Select
+            className="h-10 w-28"
+            value={filters.inboundType}
+            onChange={(event) => patchFilters({ inboundType: event.target.value as InventoryLogFilters["inboundType"] })}
+          >
+            <option value="">入库类型</option>
+            <option value="1">新货</option>
+            <option value="2">退货</option>
+          </Select>
+          <Select
+            className="h-10 w-28"
+            value={filters.stockLabel}
+            onChange={(event) => patchFilters({ stockLabel: event.target.value as InventoryLogFilters["stockLabel"] })}
+          >
+            <option value="">全部标签</option>
+            <option value="1">可售</option>
+            <option value="2">不可售</option>
+          </Select>
+          <Select
+            className="h-10 w-28"
+            value={filters.platform}
+            onChange={(event) => patchFilters({ platform: event.target.value as InventoryLogFilters["platform"] })}
+          >
+            <option value="">全部平台</option>
+            <option value="douyin">抖音</option>
+            <option value="pinduoduo">拼多多</option>
+          </Select>
+          <Button variant="secondary" onClick={onSearch}>查询</Button>
+          <Button onClick={onExport}>导出</Button>
         </div>
       </div>
       <div className="overflow-auto p-5">
@@ -2178,7 +2378,7 @@ function EditorDialog({
                   <Input type="number" min="1" step="1" value={form.quantity || 1} onChange={(event) => onChange("quantity", event.target.value)} required />
                   {dialog === "outbound" && currentStock !== null && (
                     <p className="text-xs font-medium text-red-600">
-                      当前库存数：{form.label === "unsalable" ? currentStock.unsalableQty : currentStock.salableQty}
+                      当前库存数：{currentStock.salableQty}
                     </p>
                   )}
                 </div>
@@ -2191,16 +2391,10 @@ function EditorDialog({
                   <option value="pinduoduo">拼多多</option>
                 </Select>
               </Field>
-              <Field label="标签">
+              {dialog === "inbound" && <Field label="标签">
                 <StockLabelPicker value={form.label || "salable"} onChange={(value) => onChange("label", value)}>
-                  {dialog === "outbound" && form.label === "unsalable" && (
-                    <label className="ml-2 flex items-center gap-2 text-sm font-normal text-slate-700">
-                      <input type="checkbox" checked={Boolean(form.simultaneousInbound)} onChange={(event) => onChange("simultaneousInbound", event.target.checked)} />
-                      同时入库到可售库存
-                    </label>
-                  )}
                 </StockLabelPicker>
-              </Field>
+              </Field>}
               <Field label="备注"><Input value={form.remark || ""} onChange={(event) => onChange("remark", event.target.value)} /></Field>
             </>
           )}

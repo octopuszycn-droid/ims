@@ -1,6 +1,7 @@
 import type {
   Brand,
   InventoryLog,
+  InventoryLogFilters,
   PermissionCode,
   Product,
   ProductInventoryRow,
@@ -134,13 +135,22 @@ export const api = {
   skuInventoryItem(token: string, skuId: number) {
     return request<{ skuId: number; salableQty: number; unsalableQty: number; totalQty: number }>("/api/inventory/skus/" + skuId, { token });
   },
-  logs(token: string, page = 1, size = 50, filters: { startAt?: string; endAt?: string } = {}) {
+  adjustUnsalable(token: string, skuId: number, payload: Record<string, unknown>) {
+    return request<{ skuId: number; salableQty: number; unsalableQty: number; totalQty: number }>("/api/inventory/skus/" + skuId + "/unsalable", { method: "PATCH", token, body: JSON.stringify(payload) });
+  },
+  logs(token: string, page = 1, size = 50, filters: Partial<InventoryLogFilters> = {}) {
     const params = new URLSearchParams({
       limit: String(size),
       offset: String((Math.max(1, page) - 1) * size),
     });
     if (filters.startAt) params.set("startAt", filters.startAt);
     if (filters.endAt) params.set("endAt", filters.endAt);
+    if (filters.operationType) params.set("operationType", filters.operationType);
+    if (filters.brandId) params.set("brandId", String(filters.brandId));
+    if (filters.productId) params.set("productId", String(filters.productId));
+    if (filters.inboundType) params.set("inboundType", filters.inboundType);
+    if (filters.stockLabel) params.set("stockLabel", filters.stockLabel);
+    if (filters.platform) params.set("platform", filters.platform);
     return request<{ rows: InventoryLog[]; total: number }>(`/api/inventory/logs?${params.toString()}`, { token });
   },
   inbound(token: string, payload: Record<string, unknown>) {
@@ -151,6 +161,21 @@ export const api = {
   },
   exportExcel(token: string) {
     return requestBlob("/api/excel/export", { token });
+  },
+  exportInventoryDetail(token: string) {
+    return requestBlob("/api/excel/export/inventory-detail", { token });
+  },
+  exportInventoryLogs(token: string, filters: Partial<InventoryLogFilters> = {}) {
+    const params = new URLSearchParams();
+    if (filters.startAt) params.set("startAt", filters.startAt);
+    if (filters.endAt) params.set("endAt", filters.endAt);
+    if (filters.operationType) params.set("operationType", filters.operationType);
+    if (filters.brandId) params.set("brandId", String(filters.brandId));
+    if (filters.productId) params.set("productId", String(filters.productId));
+    if (filters.inboundType) params.set("inboundType", filters.inboundType);
+    if (filters.stockLabel) params.set("stockLabel", filters.stockLabel);
+    if (filters.platform) params.set("platform", filters.platform);
+    return requestBlob(`/api/excel/export/inventory-logs${params.size ? `?${params.toString()}` : ""}`, { token });
   },
   importExcel(token: string, file: File) {
     const formData = new FormData();

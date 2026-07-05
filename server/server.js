@@ -561,6 +561,28 @@ app.get("/api/inventory/skus/:id", requireAuth, readScope, async (req, res, next
   }
 });
 
+app.patch("/api/inventory/skus/:id/unsalable", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
+  try {
+    const skuId = Number(req.params.id);
+    const quantity = toPositiveInteger(req.body.quantity, "数量");
+    const addToSalable = Boolean(req.body.addToSalable);
+    const result = await withTransaction(async (connection) => {
+      const [stockRows] = await connection.execute("select salable_qty, unsalable_qty from sku_inventory where sku_id = ? for update", [skuId]);
+      const stock = stockRows[0];
+      if (!stock) throw badRequest("规格库存不存在");
+      const currentUnsalable = Number(stock.unsalable_qty);
+      if (quantity > currentUnsalable) throw badRequest("调整数量不能大于不可售库存数");
+      const nextUnsalable = currentUnsalable - quantity;
+      const nextSalable = Number(stock.salable_qty) + (addToSalable ? quantity : 0);
+      await connection.execute("update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?", [nextSalable, nextUnsalable, skuId]);
+      return { skuId, salableQty: nextSalable, unsalableQty: nextUnsalable, totalQty: nextSalable + nextUnsalable };
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/inventory/products", requireAuth, readScope, async (_req, res, next) => {
   try {
     const byProduct = new Map();
@@ -638,43 +660,88 @@ app.post("/api/inventory/outbound", requireAuth, requireAnyPermission(["INVENTOR
   }
 });
 
-app.get("/api/inventory/logs", requireAuth, readScope, async (req, res, next) => {
-  try {
-    const limit = normalizePageLimit(req.query.limit);
-    const offset = normalizeOffset(req.query.offset);
-    const startAt = normalizeDateTimeFilter(req.query.startAt, "起始时间");
-    const endAt = normalizeDateTimeFilter(req.query.endAt, "结束时间");
-    const effectiveStartAt = normalizeDateTimeFilter(req.query.startAt, "startAt", "start");
-    const effectiveEndAt = normalizeDateTimeFilter(req.query.endAt, "endAt", "end");
-    const conditions = [];
-    const params = [];
-    if (effectiveStartAt) {
-      conditions.push("l.created_at >= ?");
-      params.push(effectiveStartAt);
-    }
-    if (effectiveEndAt) {
-      conditions.push("l.created_at <= ?");
-      params.push(effectiveEndAt);
-    }
-    const whereSql = conditions.length ? ` where ${conditions.join(" and ")}` : "";
-    const [totalRow] = await query(`select count(*) as total from inventory_operation_logs l${whereSql}`, params);
-    const rows = await query(
-      `select l.id, l.operation_type as operationType, l.inbound_type as inboundType,
-        l.stock_label as stockLabel, l.quantity, l.simultaneous_inbound as simultaneousInbound,
-        case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else '' end as platform,
-        l.remark, date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt, u.name as operatorName,
-        b.name as brandName, p.name as productName, s.name as skuName
-       from inventory_operation_logs l
+function normalizeFilterId(value, label) {
+  if (value === undefined || value === null || value === "") return 0;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number <= 0) throw badRequest(`${label}不合法`);
+  return number;
+}
+
+function buildInventoryLogQueryFilters(source) {
+  const startAt = normalizeDateTimeFilter(source.startAt, "起始时间", "start");
+  const endAt = normalizeDateTimeFilter(source.endAt, "结束时间", "end");
+  const operationType = [1, 2].includes(Number(source.operationType)) ? Number(source.operationType) : 0;
+  const brandId = normalizeFilterId(source.brandId, "品牌");
+  const productId = normalizeFilterId(source.productId, "商品");
+  const inboundType = [1, 2].includes(Number(source.inboundType)) ? Number(source.inboundType) : 0;
+  const stockLabel = [1, 2].includes(Number(source.stockLabel)) ? Number(source.stockLabel) : 0;
+  const platform = normalizePlatform(source.platform);
+  const conditions = [];
+  const params = [];
+  if (startAt) {
+    conditions.push("l.created_at >= ?");
+    params.push(startAt);
+  }
+  if (endAt) {
+    conditions.push("l.created_at <= ?");
+    params.push(endAt);
+  }
+  if (operationType) {
+    conditions.push("l.operation_type = ?");
+    params.push(operationType);
+  }
+  if (brandId) {
+    conditions.push("b.id = ?");
+    params.push(brandId);
+  }
+  if (productId) {
+    conditions.push("p.id = ?");
+    params.push(productId);
+  }
+  if (inboundType) {
+    conditions.push("l.inbound_type = ?");
+    params.push(inboundType);
+  }
+  if (stockLabel) {
+    conditions.push("l.stock_label = ?");
+    params.push(stockLabel);
+  }
+  if (platform) {
+    conditions.push("l.platform = ?");
+    params.push(platform);
+  }
+  return { whereSql: conditions.length ? ` where ${conditions.join(" and ")}` : "", params };
+}
+
+async function queryInventoryLogs(filters, paging = {}) {
+  const { whereSql, params } = buildInventoryLogQueryFilters(filters);
+  const fromSql = `from inventory_operation_logs l
        join users u on u.id = l.operator_user_id
        join skus s on s.id = l.sku_id
        join products p on p.id = s.product_id
        join brands b on b.id = p.brand_id
-       ${whereSql}
-       order by l.id desc
-       limit ? offset ?`,
-      [...params, limit, offset],
-    );
-    res.json({ rows, total: Number(totalRow?.total || 0) });
+       ${whereSql}`;
+  const [totalRow] = await query(`select count(*) as total ${fromSql}`, params);
+  const limitSql = paging.limit ? " limit ? offset ?" : "";
+  const limitParams = paging.limit ? [paging.limit, paging.offset || 0] : [];
+  const rows = await query(
+    `select l.id, l.operation_type as operationType, l.inbound_type as inboundType,
+        l.stock_label as stockLabel, l.quantity, l.simultaneous_inbound as simultaneousInbound,
+        case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else '' end as platform,
+        l.remark, date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt, u.name as operatorName,
+        b.name as brandName, p.name as productName, s.name as skuName
+       ${fromSql}
+       order by l.id desc${limitSql}`,
+    [...params, ...limitParams],
+  );
+  return { rows, total: Number(totalRow?.total || 0) };
+}
+
+app.get("/api/inventory/logs", requireAuth, readScope, async (req, res, next) => {
+  try {
+    const limit = normalizePageLimit(req.query.limit);
+    const offset = normalizeOffset(req.query.offset);
+    res.json(await queryInventoryLogs(req.query, { limit, offset }));
   } catch (error) {
     next(error);
   }
@@ -1015,6 +1082,71 @@ function sheetRows(workbook, name) {
   return rows;
 }
 
+function addInventoryDetailSheet(workbook, catalog) {
+  const inventorySheet = addRowsSheet(
+    workbook,
+    "库存明细",
+    ["品牌名", "商品名", "规格名", "库存总量", "可售库存数", "不可售库存数"],
+    catalog.map((row) => {
+      const salable = Number(row.salableQty);
+      return {
+        values: [row.brandName, row.productName, row.skuName, salable + Number(row.unsalableQty), salable, Number(row.unsalableQty)],
+        fill: salable === 0 ? "FFFFE4E6" : salable === 1 ? "FFFFF7CC" : undefined,
+        fillFromColumn: 3,
+      };
+    }),
+  );
+  if (catalog.length) mergeSame(inventorySheet, 2, catalog.length + 1, [1, 2], (row, col) => `${col === 1 ? "" : inventorySheet.getCell(row, 1).value}-` + inventorySheet.getCell(row, col).value);
+  return inventorySheet;
+}
+
+function addInventoryLogsSheet(workbook, logs) {
+  const logSheet = addRowsSheet(
+    workbook,
+    "库存操作",
+    ["时间", "类型", "品牌名", "商品名", "规格名", "入库类型", "标签", "平台", "数量", "操作人", "备注"],
+    logs.map((row) => ({
+      values: [
+        row.createdAt,
+        row.operationType === 1 ? "入库" : "出库",
+        row.brandName,
+        row.productName,
+        row.skuName,
+        row.operationType === 1 ? (row.inboundType === 1 ? "新货" : "退货") : "",
+        row.stockLabel === 1 ? "可售" : "不可售",
+        row.platform === "douyin" ? "抖音" : row.platform === "pinduoduo" ? "拼多多" : "",
+        row.quantity,
+        row.operatorName,
+        row.remark,
+      ],
+    })),
+  );
+  logSheet.eachRow((row, index) => {
+    if (index === 1) return;
+    const typeCell = row.getCell(2);
+    typeCell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: typeCell.value === "出库" ? "FFDCFCE7" : "FFFEF9C3" } };
+    if (row.getCell(6).value === "退货") row.getCell(6).font = { color: { argb: "FFDC2626" }, bold: true };
+    if (row.getCell(7).value === "不可售") row.getCell(7).font = { color: { argb: "FFDC2626" }, bold: true };
+  });
+  autoWidth(logSheet);
+  return logSheet;
+}
+
+async function buildInventoryDetailWorkbook() {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  addInventoryDetailSheet(workbook, await listCatalog());
+  return workbook;
+}
+
+async function buildInventoryLogsWorkbook(filters) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  const { rows } = await queryInventoryLogs(filters);
+  addInventoryLogsSheet(workbook, rows);
+  return workbook;
+}
+
 async function buildExportWorkbook() {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "fish-cms";
@@ -1138,6 +1270,30 @@ app.get("/api/excel/export", requireAuth, requireSuper, async (_req, res, next) 
     const buffer = await workbook.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", "attachment; filename=fish-cms-export.xlsx");
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/excel/export/inventory-detail", requireAuth, readScope, async (_req, res, next) => {
+  try {
+    const workbook = await buildInventoryDetailWorkbook();
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=inventory-detail.xlsx");
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/excel/export/inventory-logs", requireAuth, readScope, async (req, res, next) => {
+  try {
+    const workbook = await buildInventoryLogsWorkbook(req.query);
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=inventory-logs.xlsx");
     res.send(Buffer.from(buffer));
   } catch (error) {
     next(error);

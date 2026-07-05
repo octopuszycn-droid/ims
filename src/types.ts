@@ -91,6 +91,17 @@ export type InventoryLog = {
   skuName: string;
 };
 
+export type InventoryLogFilters = {
+  startAt: string;
+  endAt: string;
+  operationType: "" | "1" | "2";
+  brandId: number | "";
+  productId: number | "";
+  inboundType: "" | "1" | "2";
+  stockLabel: "" | "1" | "2";
+  platform: "" | "douyin" | "pinduoduo";
+};
+
 export type ProductSalesBreakdown = {
   productId: number;
   productName: string;
