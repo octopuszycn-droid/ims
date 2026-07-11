@@ -5,7 +5,9 @@ import ExcelJS from "exceljs";
 import express from "express";
 import jwt from "jsonwebtoken";
 import multer from "multer";
+import fs from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { pool, query, withTransaction } from "./db.js";
 
@@ -16,6 +18,9 @@ const port = Number(process.env.API_PORT || 3001);
 const jwtSecret = process.env.JWT_SECRET || "change-this-secret-before-production";
 const tokenTtlSeconds = 7 * 24 * 60 * 60;
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const currentDir = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(currentDir, "..");
+const inventoryCheckUploadDir = path.join(projectRoot, "uploads", "inventory-checks");
 
 const permissionCodeByName = { SUPER: 1, INVENTORY: 2, FINANCE: 3 };
 const permissionNameByCode = { 1: "SUPER", 2: "INVENTORY", 3: "FINANCE" };
@@ -35,12 +40,14 @@ async function ensureSchema() {
     id bigint unsigned not null auto_increment comment '盘点记录ID',
     check_time datetime not null default current_timestamp comment '盘点时间',
     operator_user_id bigint unsigned not null comment '盘点上传人用户ID',
+    upload_file_path varchar(255) not null default '' comment '盘点上传原始文件相对路径',
     created_at datetime not null default current_timestamp comment '创建时间',
     primary key (id),
     key idx_inventory_checks_time (check_time, id),
     key idx_inventory_checks_operator (operator_user_id),
     constraint fk_inventory_checks_operator foreign key (operator_user_id) references users (id)
   ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存盘点记录表'`);
+  await query("alter table inventory_checks add column if not exists upload_file_path varchar(255) not null default '' comment '盘点上传原始文件相对路径' after operator_user_id");
   await query(`create table if not exists inventory_check_differences (
     id bigint unsigned not null auto_increment comment '盘点差异明细ID',
     check_id bigint unsigned not null comment '盘点记录ID',
@@ -781,11 +788,11 @@ app.get("/api/inventory/checks", requireAuth, readScope, async (_req, res, next)
   try {
     res.json(await query(
       `select c.id, date_format(c.check_time, '%Y-%m-%d %H:%i:%s') as checkTime,
-          u.name as operatorName, count(d.id) as differenceCount
+          u.name as operatorName, c.upload_file_path as uploadFilePath, count(d.id) as differenceCount
        from inventory_checks c
        join users u on u.id = c.operator_user_id
        left join inventory_check_differences d on d.check_id = c.id
-       group by c.id, c.check_time, u.name
+       group by c.id, c.check_time, u.name, c.upload_file_path
        order by c.id desc`,
     ));
   } catch (error) {
@@ -800,6 +807,22 @@ app.get("/api/inventory/checks/:id(\\d+)", requireAuth, readScope, async (req, r
     if (!record) return res.status(404).json({ message: "盘点记录不存在" });
     res.json({ record, rows: await listInventoryCheckDifferences(checkId) });
   } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/inventory/checks/:id(\\d+)/file", requireAuth, readScope, async (req, res, next) => {
+  try {
+    const record = await getInventoryCheckRecord(Number(req.params.id));
+    if (!record) return res.status(404).json({ message: "盘点记录不存在" });
+    if (!record.uploadFilePath) return res.status(404).json({ message: "该盘点记录没有上传文件" });
+    const absolutePath = path.resolve(projectRoot, ...String(record.uploadFilePath).split("/"));
+    if (!absolutePath.startsWith(path.resolve(projectRoot, "uploads", "inventory-checks") + path.sep)) {
+      return res.status(400).json({ message: "文件路径不合法" });
+    }
+    res.download(absolutePath, `盘点数据-${record.checkTime.replace(/[^\d]/g, "").slice(0, 14)}${path.extname(absolutePath) || ".xlsx"}`);
+  } catch (error) {
+    if (error.code === "ENOENT") return res.status(404).json({ message: "上传文件不存在" });
     next(error);
   }
 });
@@ -819,7 +842,8 @@ app.get("/api/inventory/checks/template", requireAuth, readScope, async (_req, r
 app.post("/api/inventory/checks/upload", requireAuth, requireAnyPermission(["INVENTORY"]), upload.single("file"), async (req, res, next) => {
   try {
     if (!req.file) throw badRequest("请上传Excel文件");
-    res.status(201).json(await importInventoryCheckWorkbook(req.file.buffer, req.user.id));
+    const uploadFilePath = await saveInventoryCheckUploadFile(req.file);
+    res.status(201).json(await importInventoryCheckWorkbook(req.file.buffer, req.user.id, uploadFilePath));
   } catch (error) {
     next(error);
   }
@@ -1225,6 +1249,16 @@ function parseInventoryCountNumber(value, label, rowNumber) {
   return numberValue;
 }
 
+async function saveInventoryCheckUploadFile(file) {
+  await fs.mkdir(inventoryCheckUploadDir, { recursive: true });
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  const safeExt = [".xlsx", ".xls"].includes(ext) ? ext : ".xlsx";
+  const fileName = `${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${randomUUID()}${safeExt}`;
+  const relativePath = path.posix.join("uploads", "inventory-checks", fileName);
+  await fs.writeFile(path.join(projectRoot, ...relativePath.split("/")), file.buffer);
+  return relativePath;
+}
+
 async function buildInventoryCheckTemplateWorkbook() {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "fish-cms";
@@ -1235,12 +1269,12 @@ async function buildInventoryCheckTemplateWorkbook() {
 async function getInventoryCheckRecord(checkId) {
   const rows = await query(
     `select c.id, date_format(c.check_time, '%Y-%m-%d %H:%i:%s') as checkTime,
-        u.name as operatorName, count(d.id) as differenceCount
+        u.name as operatorName, c.upload_file_path as uploadFilePath, count(d.id) as differenceCount
      from inventory_checks c
      join users u on u.id = c.operator_user_id
      left join inventory_check_differences d on d.check_id = c.id
      where c.id = ?
-     group by c.id, c.check_time, u.name`,
+     group by c.id, c.check_time, u.name, c.upload_file_path`,
     [checkId],
   );
   return rows[0] || null;
@@ -1263,7 +1297,7 @@ async function listInventoryCheckDifferences(checkId) {
   );
 }
 
-async function importInventoryCheckWorkbook(buffer, operatorUserId) {
+async function importInventoryCheckWorkbook(buffer, operatorUserId, uploadFilePath) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(buffer);
   const rows = worksheetRowsWithMergedNames(workbook, "库存盘点");
@@ -1303,8 +1337,8 @@ async function importInventoryCheckWorkbook(buffer, operatorUserId) {
 
   const checkId = await withTransaction(async (connection) => {
     const [created] = await connection.execute(
-      "insert into inventory_checks(operator_user_id) values(?)",
-      [operatorUserId],
+      "insert into inventory_checks(operator_user_id, upload_file_path) values(?, ?)",
+      [operatorUserId, uploadFilePath],
     );
     for (const item of differences) {
       await connection.execute(

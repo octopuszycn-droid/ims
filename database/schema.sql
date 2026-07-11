@@ -123,6 +123,7 @@ create table if not exists `inventory_checks` (
   `id` bigint unsigned not null auto_increment comment '盘点记录ID',
   `check_time` datetime not null default current_timestamp comment '盘点时间',
   `operator_user_id` bigint unsigned not null comment '盘点上传人用户ID',
+  `upload_file_path` varchar(255) not null default '' comment '盘点上传原始文件相对路径',
   `created_at` datetime not null default current_timestamp comment '创建时间',
   primary key (`id`),
   key `idx_inventory_checks_time` (`check_time`, `id`),
@@ -172,3 +173,4 @@ alter table `sku_inventory` drop constraint if exists `chk_sku_inventory_qty`;
 alter table `sku_inventory` modify column `salable_qty` int not null default 0 comment '可售库存数';
 alter table `sku_inventory` modify column `unsalable_qty` int not null default 0 comment '不可售库存数';
 alter table `inventory_operation_logs` add column if not exists `platform` tinyint unsigned null comment '平台：1抖音，2拼多多，为空表示未选择' after `stock_label`;
+alter table `inventory_checks` add column if not exists `upload_file_path` varchar(255) not null default '' comment '盘点上传原始文件相对路径' after `operator_user_id`;

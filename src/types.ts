@@ -106,6 +106,7 @@ export type InventoryCheckRecord = {
   id: number;
   checkTime: string;
   operatorName: string;
+  uploadFilePath: string;
   differenceCount: number;
 };
 

@@ -1825,6 +1825,7 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
   const [selectedRecord, setSelectedRecord] = useState<InventoryCheckRecord | null>(null);
   const [detailRows, setDetailRows] = useState<InventoryCheckDifference[]>([]);
   const [loading, setLoading] = useState(false);
+  const [isUploadProcessing, setIsUploadProcessing] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1880,8 +1881,26 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
     }
   }
 
+  async function downloadCheckFile(record: InventoryCheckRecord) {
+    setError("");
+    try {
+      const blob = await api.inventoryCheckFile(token, record.id);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `盘点数据-${record.checkTime.replace(/[^\d]/g, "").slice(0, 14)}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "盘点数据下载失败");
+    }
+  }
+
   async function uploadCheck(file: File) {
     setLoading(true);
+    setIsUploadProcessing(true);
     setError("");
     setMessage("");
     try {
@@ -1893,75 +1912,89 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "盘点上传失败");
     } finally {
+      setIsUploadProcessing(false);
       setLoading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
+  const uploadProcessingOverlay = isUploadProcessing ? (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40">
+      <div className="flex items-center gap-3 rounded-lg bg-white px-5 py-4 text-sm font-medium text-slate-700 shadow-xl">
+        <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
+        正在处理盘点数据，请稍候...
+      </div>
+    </div>
+  ) : null;
+
   if (selectedRecord) {
     return (
-      <section className="rounded-lg border bg-white shadow-sm">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
-          <div>
-            <h2 className="text-lg font-semibold text-slate-950">盘点详情</h2>
-            <p className="mt-1 text-sm text-slate-500">
-              {selectedRecord.checkTime} · {selectedRecord.operatorName} · 差异 {selectedRecord.differenceCount} 条
-            </p>
+      <>
+        {uploadProcessingOverlay}
+        <section className="rounded-lg border bg-white shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
+            <div>
+              <h2 className="text-lg font-semibold text-slate-950">盘点详情</h2>
+              <p className="mt-1 text-sm text-slate-500">
+                {selectedRecord.checkTime} · {selectedRecord.operatorName} · 差异 {selectedRecord.differenceCount} 条
+              </p>
+            </div>
+            <Button variant="secondary" onClick={() => {
+              setSelectedRecord(null);
+              setDetailRows([]);
+            }}>返回列表</Button>
           </div>
-          <Button variant="secondary" onClick={() => {
-            setSelectedRecord(null);
-            setDetailRows([]);
-          }}>返回列表</Button>
-        </div>
-        {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-        <div className="overflow-auto p-5">
-          <table className={`${tableBase} min-w-[1180px]`}>
-            <thead>
-              <tr>
-                <th className={thBase}>品牌名</th>
-                <th className={thBase}>商品名</th>
-                <th className={thBase}>规格名</th>
-                <th className={thBase}>可售库存数</th>
-                <th className={thBase}>不可售库存数</th>
-                <th className={thBase}>实际可售库存数</th>
-                <th className={thBase}>实际不可售库存数</th>
-                <th className={thBase}>可售库存数差值</th>
-                <th className={thBase}>不可售库存数差值</th>
-              </tr>
-            </thead>
-            <tbody>
-              {detailPagination.pageRows.map((row, index) => {
-                const brandSpan = rowSpanFor(detailPagination.pageRows, index, (item) => item.brandName);
-                const productSpan = rowSpanFor(detailPagination.pageRows, index, (item) => `${item.brandName}-${item.productName}`);
-                return (
-                  <tr key={row.id}>
-                    {brandSpan > 0 && <td className={`${tdBase} text-center font-medium`} rowSpan={brandSpan}>{row.brandName}</td>}
-                    {productSpan > 0 && <td className={`${tdBase} text-center`} rowSpan={productSpan}>{row.productName}</td>}
-                    <td className={tdBase}>{row.skuName}</td>
-                    <td className={tdBase}>{row.systemSalableQty}</td>
-                    <td className={tdBase}>{row.systemUnsalableQty}</td>
-                    <td className={tdBase}>{row.actualSalableQty}</td>
-                    <td className={tdBase}>{row.actualUnsalableQty}</td>
-                    <td className={[tdBase, diffClass(row.salableDiffQty)].join(" ")}>{formatSigned(row.salableDiffQty)}</td>
-                    <td className={[tdBase, diffClass(row.unsalableDiffQty)].join(" ")}>{formatSigned(row.unsalableDiffQty)}</td>
-                  </tr>
-                );
-              })}
-              {!detailRows.length && (
+          {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+          <div className="overflow-auto p-5">
+            <table className={`${tableBase} min-w-[1180px]`}>
+              <thead>
                 <tr>
-                  <td className={`${tdBase} text-center text-slate-500`} colSpan={9}>本次盘点没有差异</td>
+                  <th className={thBase}>品牌名</th>
+                  <th className={thBase}>商品名</th>
+                  <th className={thBase}>规格名</th>
+                  <th className={thBase}>可售库存数</th>
+                  <th className={thBase}>不可售库存数</th>
+                  <th className={thBase}>实际可售库存数</th>
+                  <th className={thBase}>实际不可售库存数</th>
+                  <th className={thBase}>可售库存数差值</th>
+                  <th className={thBase}>不可售库存数差值</th>
                 </tr>
-              )}
-            </tbody>
-          </table>
-          <PaginationBar {...detailPagination} onPageChange={detailPagination.setPage} />
-        </div>
-      </section>
+              </thead>
+              <tbody>
+                {detailPagination.pageRows.map((row, index) => {
+                  const brandSpan = rowSpanFor(detailPagination.pageRows, index, (item) => item.brandName);
+                  const productSpan = rowSpanFor(detailPagination.pageRows, index, (item) => `${item.brandName}-${item.productName}`);
+                  return (
+                    <tr key={row.id}>
+                      {brandSpan > 0 && <td className={`${tdBase} text-center font-medium`} rowSpan={brandSpan}>{row.brandName}</td>}
+                      {productSpan > 0 && <td className={`${tdBase} text-center`} rowSpan={productSpan}>{row.productName}</td>}
+                      <td className={tdBase}>{row.skuName}</td>
+                      <td className={tdBase}>{row.systemSalableQty}</td>
+                      <td className={tdBase}>{row.systemUnsalableQty}</td>
+                      <td className={tdBase}>{row.actualSalableQty}</td>
+                      <td className={tdBase}>{row.actualUnsalableQty}</td>
+                      <td className={[tdBase, diffClass(row.salableDiffQty)].join(" ")}>{formatSigned(row.salableDiffQty)}</td>
+                      <td className={[tdBase, diffClass(row.unsalableDiffQty)].join(" ")}>{formatSigned(row.unsalableDiffQty)}</td>
+                    </tr>
+                  );
+                })}
+                {!detailRows.length && (
+                  <tr>
+                    <td className={`${tdBase} text-center text-slate-500`} colSpan={9}>本次盘点没有差异</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+            <PaginationBar {...detailPagination} onPageChange={detailPagination.setPage} />
+          </div>
+        </section>
+      </>
     );
   }
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
+      {uploadProcessingOverlay}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
         <h2 className="text-lg font-semibold text-slate-950">库存盘点</h2>
         <div className="flex items-center gap-2">
@@ -1992,7 +2025,8 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
               <th className={thBase}>盘点时间</th>
               <th className={thBase}>差异数量</th>
               <th className={thBase}>操作人</th>
-              <th className={actionTh}>操作</th>
+              <th className={actionTh}>查看详情</th>
+              <th className={actionTh}>下载盘点数据</th>
             </tr>
           </thead>
           <tbody>
@@ -2002,11 +2036,14 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
                 <td className={tdBase}>{record.differenceCount}</td>
                 <td className={tdBase}>{record.operatorName}</td>
                 <td className={actionTd}><ActionLink onClick={() => void openDetail(record.id)}>查看详情</ActionLink></td>
+                <td className={actionTd}>
+                  {record.uploadFilePath ? <ActionLink onClick={() => void downloadCheckFile(record)}>下载</ActionLink> : <span className="text-slate-400">-</span>}
+                </td>
               </tr>
             ))}
             {!records.length && (
               <tr>
-                <td className={`${tdBase} text-center text-slate-500`} colSpan={4}>暂无盘点记录</td>
+                <td className={`${tdBase} text-center text-slate-500`} colSpan={5}>暂无盘点记录</td>
               </tr>
             )}
           </tbody>

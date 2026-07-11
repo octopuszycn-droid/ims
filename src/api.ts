@@ -188,6 +188,9 @@ export const api = {
   inventoryCheckTemplate(token: string) {
     return requestBlob("/api/inventory/checks/template", { token });
   },
+  inventoryCheckFile(token: string, id: number) {
+    return requestBlob(`/api/inventory/checks/${id}/file`, { token });
+  },
   uploadInventoryCheck(token: string, file: File) {
     const formData = new FormData();
     formData.append("file", file);
