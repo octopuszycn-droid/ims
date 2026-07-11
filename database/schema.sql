@@ -119,6 +119,38 @@ create table if not exists `inventory_operation_logs` (
   constraint `chk_inventory_logs_simultaneous` check (`simultaneous_inbound` in (0, 1))
 ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存操作日志表';
 
+create table if not exists `inventory_checks` (
+  `id` bigint unsigned not null auto_increment comment '盘点记录ID',
+  `check_time` datetime not null default current_timestamp comment '盘点时间',
+  `operator_user_id` bigint unsigned not null comment '盘点上传人用户ID',
+  `created_at` datetime not null default current_timestamp comment '创建时间',
+  primary key (`id`),
+  key `idx_inventory_checks_time` (`check_time`, `id`),
+  key `idx_inventory_checks_operator` (`operator_user_id`),
+  constraint `fk_inventory_checks_operator` foreign key (`operator_user_id`) references `users` (`id`)
+) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存盘点记录表';
+
+create table if not exists `inventory_check_differences` (
+  `id` bigint unsigned not null auto_increment comment '盘点差异明细ID',
+  `check_id` bigint unsigned not null comment '盘点记录ID',
+  `sku_id` bigint unsigned not null comment 'SKU ID',
+  `brand_name` varchar(64) not null comment '盘点时品牌名快照',
+  `product_name` varchar(64) not null comment '盘点时商品名快照',
+  `sku_name` varchar(64) not null comment '盘点时规格名快照',
+  `system_salable_qty` int not null comment '系统可售库存数',
+  `system_unsalable_qty` int not null comment '系统不可售库存数',
+  `actual_salable_qty` int not null comment '实际可售库存数',
+  `actual_unsalable_qty` int not null comment '实际不可售库存数',
+  `salable_diff_qty` int not null comment '可售库存数差值：实际-系统',
+  `unsalable_diff_qty` int not null comment '不可售库存数差值：实际-系统',
+  `created_at` datetime not null default current_timestamp comment '创建时间',
+  primary key (`id`),
+  key `idx_inventory_check_diff_check` (`check_id`, `id`),
+  key `idx_inventory_check_diff_sku` (`sku_id`),
+  constraint `fk_inventory_check_diff_check` foreign key (`check_id`) references `inventory_checks` (`id`) on delete cascade,
+  constraint `fk_inventory_check_diff_sku` foreign key (`sku_id`) references `skus` (`id`)
+) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存盘点差异明细表';
+
 insert into `permissions` (`code`, `name`, `description`) values
   (1, 'SUPER', '超级权限'),
   (2, 'INVENTORY', '库存权限'),

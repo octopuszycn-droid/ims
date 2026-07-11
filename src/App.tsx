@@ -4,6 +4,8 @@ import { Eye, EyeOff, GripVertical, Loader2, Minus, PencilLine, Plus, X } from "
 import { ApiError, api } from "./api";
 import type {
   Brand,
+  InventoryCheckDifference,
+  InventoryCheckRecord,
   InventoryLog,
   InventoryLogFilters,
   PermissionCode,
@@ -56,6 +58,7 @@ type PageKey =
   | "inventory-summary"
   | "inventory-detail"
   | "inventory-logs"
+  | "inventory-checks"
   | "sales-stats"
   | "inventory-amount"
   | "sales-amount";
@@ -90,6 +93,7 @@ const navGroups: NavGroup[] = [
       { key: "inventory-summary", label: "库存总计" },
       { key: "inventory-detail", label: "库存明细" },
       { key: "inventory-logs", label: "库存操作" },
+      { key: "inventory-checks", label: "库存盘点" },
     ],
   },
   {
@@ -778,6 +782,12 @@ export function App() {
               }}
               onInbound={() => void openStockDialog("inbound")}
               onOutbound={() => void openStockDialog("outbound")}
+            />
+          )}
+          {activePage === "inventory-checks" && (
+            <InventoryCheckPage
+              token={session.token}
+              canUpload={session.permissions.includes("SUPER") || session.permissions.includes("INVENTORY")}
             />
           )}
           {activePage === "sales-stats" && (
@@ -1808,6 +1818,215 @@ function LogTable({
       </div>
     </section>
   );
+}
+
+function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: boolean }) {
+  const [records, setRecords] = useState<InventoryCheckRecord[]>([]);
+  const [selectedRecord, setSelectedRecord] = useState<InventoryCheckRecord | null>(null);
+  const [detailRows, setDetailRows] = useState<InventoryCheckDifference[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const recordPagination = usePagination(records);
+  const detailPagination = usePagination(detailRows);
+
+  async function loadRecords() {
+    setLoading(true);
+    setError("");
+    try {
+      setRecords(await api.inventoryChecks(token));
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "盘点记录加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadRecords();
+  }, [token]);
+
+  async function openDetail(id: number) {
+    setLoading(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await api.inventoryCheckDetail(token, id);
+      setSelectedRecord(result.record);
+      setDetailRows(result.rows);
+      detailPagination.setPage(1);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "盘点详情加载失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function downloadTemplate() {
+    setError("");
+    try {
+      const blob = await api.inventoryCheckTemplate(token);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `库存盘点模板-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "模板下载失败");
+    }
+  }
+
+  async function uploadCheck(file: File) {
+    setLoading(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await api.uploadInventoryCheck(token, file);
+      setSelectedRecord(result.record);
+      setDetailRows(result.rows);
+      setMessage(`上传成功，本次盘点发现 ${result.rows.length} 条差异`);
+      await loadRecords();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "盘点上传失败");
+    } finally {
+      setLoading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  if (selectedRecord) {
+    return (
+      <section className="rounded-lg border bg-white shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-950">盘点详情</h2>
+            <p className="mt-1 text-sm text-slate-500">
+              {selectedRecord.checkTime} · {selectedRecord.operatorName} · 差异 {selectedRecord.differenceCount} 条
+            </p>
+          </div>
+          <Button variant="secondary" onClick={() => {
+            setSelectedRecord(null);
+            setDetailRows([]);
+          }}>返回列表</Button>
+        </div>
+        {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+        <div className="overflow-auto p-5">
+          <table className={`${tableBase} min-w-[1180px]`}>
+            <thead>
+              <tr>
+                <th className={thBase}>品牌名</th>
+                <th className={thBase}>商品名</th>
+                <th className={thBase}>规格名</th>
+                <th className={thBase}>可售库存数</th>
+                <th className={thBase}>不可售库存数</th>
+                <th className={thBase}>实际可售库存数</th>
+                <th className={thBase}>实际不可售库存数</th>
+                <th className={thBase}>可售库存数差值</th>
+                <th className={thBase}>不可售库存数差值</th>
+              </tr>
+            </thead>
+            <tbody>
+              {detailPagination.pageRows.map((row, index) => {
+                const brandSpan = rowSpanFor(detailPagination.pageRows, index, (item) => item.brandName);
+                const productSpan = rowSpanFor(detailPagination.pageRows, index, (item) => `${item.brandName}-${item.productName}`);
+                return (
+                  <tr key={row.id}>
+                    {brandSpan > 0 && <td className={`${tdBase} text-center font-medium`} rowSpan={brandSpan}>{row.brandName}</td>}
+                    {productSpan > 0 && <td className={`${tdBase} text-center`} rowSpan={productSpan}>{row.productName}</td>}
+                    <td className={tdBase}>{row.skuName}</td>
+                    <td className={tdBase}>{row.systemSalableQty}</td>
+                    <td className={tdBase}>{row.systemUnsalableQty}</td>
+                    <td className={tdBase}>{row.actualSalableQty}</td>
+                    <td className={tdBase}>{row.actualUnsalableQty}</td>
+                    <td className={[tdBase, diffClass(row.salableDiffQty)].join(" ")}>{formatSigned(row.salableDiffQty)}</td>
+                    <td className={[tdBase, diffClass(row.unsalableDiffQty)].join(" ")}>{formatSigned(row.unsalableDiffQty)}</td>
+                  </tr>
+                );
+              })}
+              {!detailRows.length && (
+                <tr>
+                  <td className={`${tdBase} text-center text-slate-500`} colSpan={9}>本次盘点没有差异</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          <PaginationBar {...detailPagination} onPageChange={detailPagination.setPage} />
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="rounded-lg border bg-white shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
+        <h2 className="text-lg font-semibold text-slate-950">库存盘点</h2>
+        <div className="flex items-center gap-2">
+          <Button variant="secondary" onClick={() => void downloadTemplate()}>下载模板</Button>
+          {canUpload && (
+            <>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".xlsx,.xls"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void uploadCheck(file);
+                }}
+              />
+              <Button onClick={() => fileInputRef.current?.click()} disabled={loading}>上传数据</Button>
+            </>
+          )}
+        </div>
+      </div>
+      {message && <p className="m-5 rounded-md border border-green-200 bg-green-50 p-3 text-sm text-green-700">{message}</p>}
+      {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+      <div className="overflow-auto p-5">
+        <table className={`${tableBase} min-w-[760px]`}>
+          <thead>
+            <tr>
+              <th className={thBase}>盘点时间</th>
+              <th className={thBase}>差异数量</th>
+              <th className={thBase}>操作人</th>
+              <th className={actionTh}>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {recordPagination.pageRows.map((record) => (
+              <tr key={record.id}>
+                <td className={tdBase}>{record.checkTime}</td>
+                <td className={tdBase}>{record.differenceCount}</td>
+                <td className={tdBase}>{record.operatorName}</td>
+                <td className={actionTd}><ActionLink onClick={() => void openDetail(record.id)}>查看详情</ActionLink></td>
+              </tr>
+            ))}
+            {!records.length && (
+              <tr>
+                <td className={`${tdBase} text-center text-slate-500`} colSpan={4}>暂无盘点记录</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+        <PaginationBar {...recordPagination} onPageChange={recordPagination.setPage} />
+      </div>
+    </section>
+  );
+}
+
+function formatSigned(value: number) {
+  const numeric = Number(value || 0);
+  return numeric > 0 ? `+${numeric}` : String(numeric);
+}
+
+function diffClass(value: number) {
+  const numeric = Number(value || 0);
+  if (numeric > 0) return "font-semibold text-green-700";
+  if (numeric < 0) return "font-semibold text-red-700";
+  return "";
 }
 
 function StatsPage({ token, brands }: { token: string; brands: Brand[] }) {

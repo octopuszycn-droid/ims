@@ -31,6 +31,36 @@ async function ensureSchema() {
   await query("alter table products add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
   await query("alter table skus add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
   await query("alter table inventory_operation_logs add column if not exists platform tinyint unsigned null comment '平台：1抖音，2拼多多，为空表示未选择' after stock_label");
+  await query(`create table if not exists inventory_checks (
+    id bigint unsigned not null auto_increment comment '盘点记录ID',
+    check_time datetime not null default current_timestamp comment '盘点时间',
+    operator_user_id bigint unsigned not null comment '盘点上传人用户ID',
+    created_at datetime not null default current_timestamp comment '创建时间',
+    primary key (id),
+    key idx_inventory_checks_time (check_time, id),
+    key idx_inventory_checks_operator (operator_user_id),
+    constraint fk_inventory_checks_operator foreign key (operator_user_id) references users (id)
+  ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存盘点记录表'`);
+  await query(`create table if not exists inventory_check_differences (
+    id bigint unsigned not null auto_increment comment '盘点差异明细ID',
+    check_id bigint unsigned not null comment '盘点记录ID',
+    sku_id bigint unsigned not null comment 'SKU ID',
+    brand_name varchar(64) not null comment '盘点时品牌名快照',
+    product_name varchar(64) not null comment '盘点时商品名快照',
+    sku_name varchar(64) not null comment '盘点时规格名快照',
+    system_salable_qty int not null comment '系统可售库存数',
+    system_unsalable_qty int not null comment '系统不可售库存数',
+    actual_salable_qty int not null comment '实际可售库存数',
+    actual_unsalable_qty int not null comment '实际不可售库存数',
+    salable_diff_qty int not null comment '可售库存数差值：实际-系统',
+    unsalable_diff_qty int not null comment '不可售库存数差值：实际-系统',
+    created_at datetime not null default current_timestamp comment '创建时间',
+    primary key (id),
+    key idx_inventory_check_diff_check (check_id, id),
+    key idx_inventory_check_diff_sku (sku_id),
+    constraint fk_inventory_check_diff_check foreign key (check_id) references inventory_checks (id) on delete cascade,
+    constraint fk_inventory_check_diff_sku foreign key (sku_id) references skus (id)
+  ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存盘点差异明细表'`);
   try {
     await query("alter table sku_inventory drop constraint chk_sku_inventory_qty");
   } catch (error) {
@@ -747,6 +777,54 @@ app.get("/api/inventory/logs", requireAuth, readScope, async (req, res, next) =>
   }
 });
 
+app.get("/api/inventory/checks", requireAuth, readScope, async (_req, res, next) => {
+  try {
+    res.json(await query(
+      `select c.id, date_format(c.check_time, '%Y-%m-%d %H:%i:%s') as checkTime,
+          u.name as operatorName, count(d.id) as differenceCount
+       from inventory_checks c
+       join users u on u.id = c.operator_user_id
+       left join inventory_check_differences d on d.check_id = c.id
+       group by c.id, c.check_time, u.name
+       order by c.id desc`,
+    ));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/inventory/checks/:id(\\d+)", requireAuth, readScope, async (req, res, next) => {
+  try {
+    const checkId = Number(req.params.id);
+    const record = await getInventoryCheckRecord(checkId);
+    if (!record) return res.status(404).json({ message: "盘点记录不存在" });
+    res.json({ record, rows: await listInventoryCheckDifferences(checkId) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/inventory/checks/template", requireAuth, readScope, async (_req, res, next) => {
+  try {
+    const workbook = await buildInventoryCheckTemplateWorkbook();
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=inventory-check-template.xlsx");
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/inventory/checks/upload", requireAuth, requireAnyPermission(["INVENTORY"]), upload.single("file"), async (req, res, next) => {
+  try {
+    if (!req.file) throw badRequest("请上传Excel文件");
+    res.status(201).json(await importInventoryCheckWorkbook(req.file.buffer, req.user.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
 function normalizeDays(value) {
   const days = Number(value || 7);
   return [7, 15, 30].includes(days) ? days : 7;
@@ -1098,6 +1176,165 @@ function addInventoryDetailSheet(workbook, catalog) {
   );
   if (catalog.length) mergeSame(inventorySheet, 2, catalog.length + 1, [1, 2], (row, col) => `${col === 1 ? "" : inventorySheet.getCell(row, 1).value}-` + inventorySheet.getCell(row, col).value);
   return inventorySheet;
+}
+
+function addInventoryCheckTemplateSheet(workbook, catalog) {
+  const sheet = addRowsSheet(
+    workbook,
+    "库存盘点",
+    ["品牌名", "商品名", "规格名", "可售库存数", "不可售库存数"],
+    catalog.map((row) => ({
+      values: [row.brandName, row.productName, row.skuName, "", ""],
+    })),
+  );
+  if (catalog.length) mergeSame(sheet, 2, catalog.length + 1, [1, 2], (row, col) => `${col === 1 ? "" : sheet.getCell(row, 1).value}-` + sheet.getCell(row, col).value);
+  sheet.getColumn(4).width = 16;
+  sheet.getColumn(5).width = 18;
+  return sheet;
+}
+
+function worksheetRowsWithMergedNames(workbook, name) {
+  const sheet = workbook.getWorksheet(name) || workbook.worksheets[0];
+  if (!sheet) return [];
+  const headers = sheet.getRow(1).values.slice(1).map((value) => String(value || "").trim());
+  const rows = [];
+  let brandName = "";
+  let productName = "";
+  sheet.eachRow((row, index) => {
+    if (index === 1) return;
+    const item = {};
+    headers.forEach((header, headerIndex) => {
+      item[header] = row.getCell(headerIndex + 1).value ?? "";
+    });
+    if (item["品牌名"]) brandName = String(item["品牌名"]).trim();
+    if (item["商品名"]) productName = String(item["商品名"]).trim();
+    item["品牌名"] = brandName;
+    item["商品名"] = productName;
+    if (Object.values(item).some((value) => value !== "")) {
+      item.__rowNumber = index;
+      rows.push(item);
+    }
+  });
+  return rows;
+}
+
+function parseInventoryCountNumber(value, label, rowNumber) {
+  if (value === null || value === undefined || value === "") throw badRequest(`第${rowNumber}行${label}不能为空`);
+  const numberValue = Number(value);
+  if (!Number.isInteger(numberValue)) throw badRequest(`第${rowNumber}行${label}必须是整数`);
+  return numberValue;
+}
+
+async function buildInventoryCheckTemplateWorkbook() {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  addInventoryCheckTemplateSheet(workbook, await listCatalog());
+  return workbook;
+}
+
+async function getInventoryCheckRecord(checkId) {
+  const rows = await query(
+    `select c.id, date_format(c.check_time, '%Y-%m-%d %H:%i:%s') as checkTime,
+        u.name as operatorName, count(d.id) as differenceCount
+     from inventory_checks c
+     join users u on u.id = c.operator_user_id
+     left join inventory_check_differences d on d.check_id = c.id
+     where c.id = ?
+     group by c.id, c.check_time, u.name`,
+    [checkId],
+  );
+  return rows[0] || null;
+}
+
+async function listInventoryCheckDifferences(checkId) {
+  return query(
+    `select id, check_id as checkId, sku_id as skuId,
+        brand_name as brandName, product_name as productName, sku_name as skuName,
+        system_salable_qty as systemSalableQty,
+        system_unsalable_qty as systemUnsalableQty,
+        actual_salable_qty as actualSalableQty,
+        actual_unsalable_qty as actualUnsalableQty,
+        salable_diff_qty as salableDiffQty,
+        unsalable_diff_qty as unsalableDiffQty
+     from inventory_check_differences
+     where check_id = ?
+     order by id`,
+    [checkId],
+  );
+}
+
+async function importInventoryCheckWorkbook(buffer, operatorUserId) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  const rows = worksheetRowsWithMergedNames(workbook, "库存盘点");
+  if (!rows.length) throw badRequest("盘点表不能为空");
+  const catalog = await listCatalog();
+  const catalogMap = new Map(catalog.map((row) => [`${row.brandName}\u0001${row.productName}\u0001${row.skuName}`, row]));
+  const differences = [];
+
+  for (const row of rows) {
+    const brandName = String(row["品牌名"] || "").trim();
+    const productName = String(row["商品名"] || "").trim();
+    const skuName = String(row["规格名"] || "").trim();
+    if (!brandName || !productName || !skuName) throw badRequest(`第${row.__rowNumber}行品牌名、商品名、规格名不能为空`);
+    const catalogRow = catalogMap.get(`${brandName}\u0001${productName}\u0001${skuName}`);
+    if (!catalogRow) throw badRequest(`第${row.__rowNumber}行未找到对应库存：${brandName}/${productName}/${skuName}`);
+    const actualSalableQty = parseInventoryCountNumber(row["可售库存数"], "可售库存数", row.__rowNumber);
+    const actualUnsalableQty = parseInventoryCountNumber(row["不可售库存数"], "不可售库存数", row.__rowNumber);
+    const systemSalableQty = Number(catalogRow.salableQty);
+    const systemUnsalableQty = Number(catalogRow.unsalableQty);
+    const salableDiffQty = actualSalableQty - systemSalableQty;
+    const unsalableDiffQty = actualUnsalableQty - systemUnsalableQty;
+    if (salableDiffQty !== 0 || unsalableDiffQty !== 0) {
+      differences.push({
+        skuId: catalogRow.skuId,
+        brandName,
+        productName,
+        skuName,
+        systemSalableQty,
+        systemUnsalableQty,
+        actualSalableQty,
+        actualUnsalableQty,
+        salableDiffQty,
+        unsalableDiffQty,
+      });
+    }
+  }
+
+  const checkId = await withTransaction(async (connection) => {
+    const [created] = await connection.execute(
+      "insert into inventory_checks(operator_user_id) values(?)",
+      [operatorUserId],
+    );
+    for (const item of differences) {
+      await connection.execute(
+        `insert into inventory_check_differences
+          (check_id, sku_id, brand_name, product_name, sku_name,
+           system_salable_qty, system_unsalable_qty, actual_salable_qty, actual_unsalable_qty,
+           salable_diff_qty, unsalable_diff_qty)
+         values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          created.insertId,
+          item.skuId,
+          item.brandName,
+          item.productName,
+          item.skuName,
+          item.systemSalableQty,
+          item.systemUnsalableQty,
+          item.actualSalableQty,
+          item.actualUnsalableQty,
+          item.salableDiffQty,
+          item.unsalableDiffQty,
+        ],
+      );
+    }
+    return created.insertId;
+  });
+
+  return {
+    record: await getInventoryCheckRecord(checkId),
+    rows: await listInventoryCheckDifferences(checkId),
+  };
 }
 
 function addInventoryLogsSheet(workbook, logs) {

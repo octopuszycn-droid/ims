@@ -102,6 +102,28 @@ export type InventoryLogFilters = {
   platform: "" | "douyin" | "pinduoduo";
 };
 
+export type InventoryCheckRecord = {
+  id: number;
+  checkTime: string;
+  operatorName: string;
+  differenceCount: number;
+};
+
+export type InventoryCheckDifference = {
+  id: number;
+  checkId: number;
+  skuId: number;
+  brandName: string;
+  productName: string;
+  skuName: string;
+  systemSalableQty: number;
+  systemUnsalableQty: number;
+  actualSalableQty: number;
+  actualUnsalableQty: number;
+  salableDiffQty: number;
+  unsalableDiffQty: number;
+};
+
 export type ProductSalesBreakdown = {
   productId: number;
   productName: string;

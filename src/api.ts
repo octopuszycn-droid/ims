@@ -1,5 +1,7 @@
 import type {
   Brand,
+  InventoryCheckDifference,
+  InventoryCheckRecord,
   InventoryLog,
   InventoryLogFilters,
   PermissionCode,
@@ -176,6 +178,20 @@ export const api = {
     if (filters.stockLabel) params.set("stockLabel", filters.stockLabel);
     if (filters.platform) params.set("platform", filters.platform);
     return requestBlob(`/api/excel/export/inventory-logs${params.size ? `?${params.toString()}` : ""}`, { token });
+  },
+  inventoryChecks(token: string) {
+    return request<InventoryCheckRecord[]>("/api/inventory/checks", { token });
+  },
+  inventoryCheckDetail(token: string, id: number) {
+    return request<{ record: InventoryCheckRecord; rows: InventoryCheckDifference[] }>(`/api/inventory/checks/${id}`, { token });
+  },
+  inventoryCheckTemplate(token: string) {
+    return requestBlob("/api/inventory/checks/template", { token });
+  },
+  uploadInventoryCheck(token: string, file: File) {
+    const formData = new FormData();
+    formData.append("file", file);
+    return request<{ record: InventoryCheckRecord; rows: InventoryCheckDifference[] }>("/api/inventory/checks/upload", { method: "POST", token, body: formData });
   },
   importExcel(token: string, file: File) {
     const formData = new FormData();
