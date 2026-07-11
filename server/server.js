@@ -908,13 +908,13 @@ app.get("/api/stats/sales/amount", requireAuth, readScope, async (req, res, next
         `select b.id as brandId, b.name as brandName,
           p.id as productId, p.name as productName,
           s.id as skuId, s.name as skuName, s.purchase_price as purchasePrice,
-          sum(l.quantity) as salesQty,
-          sum(l.quantity * s.purchase_price) as costAmount
+          sum(case when l.operation_type = 2 then l.quantity else -l.quantity end) as salesQty,
+          sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as costAmount
          from inventory_operation_logs l
          join skus s on s.id = l.sku_id
          join products p on p.id = s.product_id
          join brands b on b.id = p.brand_id
-         where l.operation_type = 2 and l.stock_label = 1
+         where (l.operation_type = 2 or (l.operation_type = 1 and l.inbound_type = 2))
            and l.created_at >= ? and l.created_at < date_add(?, interval 1 day)
          group by b.id, b.name, b.sort_order, p.id, p.name, p.sort_order, s.id, s.name, s.sort_order, s.purchase_price
          order by b.sort_order, b.id, p.sort_order, p.id, s.sort_order, s.id`,

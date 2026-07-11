@@ -2187,7 +2187,10 @@ function SalesAmountPage({ token }: { token: string }) {
   return (
     <section className="rounded-lg border bg-white shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
-        <h2 className="text-lg font-semibold text-slate-950">销售金额</h2>
+        <div className="flex flex-wrap items-baseline gap-2">
+          <h2 className="text-lg font-semibold text-slate-950">销售金额</h2>
+          <span className="text-xs text-slate-400">出库金额-退货入库金额</span>
+        </div>
         <div className="flex items-center gap-2">
           <Input className="w-40" type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} />
           <span className="text-sm text-slate-500">至</span>
