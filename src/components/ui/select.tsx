@@ -5,7 +5,7 @@ import { cn } from "../../lib/utils";
 export function Select({ className, children, ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
   const wrapperClassName = String(className || "")
     .split(/\s+/)
-    .filter((item) => item.startsWith("w-") || item.startsWith("min-w-") || item.startsWith("max-w-"))
+    .filter((item) => /(^|:)w-/.test(item) || /(^|:)min-w-/.test(item) || /(^|:)max-w-/.test(item))
     .join(" ");
 
   return (

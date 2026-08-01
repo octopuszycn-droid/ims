@@ -31,6 +31,7 @@ app.use(express.json({ limit: "1mb" }));
 await ensureSchema();
 
 async function ensureSchema() {
+  await query("alter table users modify column email varchar(128) null comment 'optional notification email'");
   await query("alter table brands add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
   await query("alter table brands add column if not exists default_platform tinyint unsigned null comment '默认平台：1抖音，2拼多多，为空表示未选择' after remark");
   await query("alter table products add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
@@ -48,6 +49,8 @@ async function ensureSchema() {
     constraint fk_inventory_checks_operator foreign key (operator_user_id) references users (id)
   ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存盘点记录表'`);
   await query("alter table inventory_checks add column if not exists upload_file_path varchar(255) not null default '' comment '盘点上传原始文件相对路径' after operator_user_id");
+  await query("alter table inventory_checks add column if not exists is_synced tinyint unsigned not null default 0 comment 'whether differences have been synced' after upload_file_path");
+  await query("alter table inventory_checks add column if not exists synced_at datetime null comment 'difference sync time' after is_synced");
   await query(`create table if not exists inventory_check_differences (
     id bigint unsigned not null auto_increment comment '盘点差异明细ID',
     check_id bigint unsigned not null comment '盘点记录ID',
@@ -68,6 +71,23 @@ async function ensureSchema() {
     constraint fk_inventory_check_diff_check foreign key (check_id) references inventory_checks (id) on delete cascade,
     constraint fk_inventory_check_diff_sku foreign key (sku_id) references skus (id)
   ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存盘点差异明细表'`);
+  await query("alter table inventory_check_differences add column if not exists purchase_price_snapshot decimal(10,2) not null default 0.00 comment '盘点时SKU购入价格快照' after unsalable_diff_qty");
+  await query(`create table if not exists inventory_abnormal_logs (
+    id bigint unsigned not null auto_increment comment '异常库存记录ID',
+    sku_id bigint unsigned not null comment 'SKU ID',
+    quantity int not null comment '异常调整数量，正数增加可售库存，负数减少可售库存',
+    reason varchar(255) not null comment '异常原因',
+    operator_user_id bigint unsigned not null comment '操作人用户ID',
+    created_at datetime not null default current_timestamp comment '创建时间',
+    primary key (id),
+    key idx_inventory_abnormal_time (created_at, id),
+    key idx_inventory_abnormal_sku_time (sku_id, created_at),
+    key idx_inventory_abnormal_operator_time (operator_user_id, created_at),
+    constraint fk_inventory_abnormal_sku foreign key (sku_id) references skus (id),
+    constraint fk_inventory_abnormal_operator foreign key (operator_user_id) references users (id),
+    constraint chk_inventory_abnormal_quantity check (quantity <> 0)
+  ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='异常库存操作记录表'`);
+  await query("alter table inventory_abnormal_logs add column if not exists stock_label tinyint unsigned not null default 1 comment 'stock label: 1 salable, 2 unsalable' after sku_id");
   try {
     await query("alter table sku_inventory drop constraint chk_sku_inventory_qty");
   } catch (error) {
@@ -75,6 +95,28 @@ async function ensureSchema() {
   }
   await query("alter table sku_inventory modify column salable_qty int not null default 0 comment '可售库存数'");
   await query("alter table sku_inventory modify column unsalable_qty int not null default 0 comment '不可售库存数'");
+  await query(`create table if not exists scheduled_email_jobs (
+    job_key varchar(80) not null comment 'unique scheduled job key',
+    job_type varchar(64) not null comment 'scheduled job type',
+    status tinyint unsigned not null comment '1 running, 2 sent, 3 failed',
+    run_at datetime not null comment 'scheduled run time',
+    sent_at datetime null comment 'sent time',
+    recipients text null comment 'email recipients',
+    message varchar(500) not null default '' comment 'last message',
+    created_at datetime not null default current_timestamp comment 'created time',
+    updated_at datetime not null default current_timestamp on update current_timestamp comment 'updated time',
+    primary key (job_key),
+    key idx_scheduled_email_jobs_type_status (job_type, status, run_at)
+  ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='scheduled email job log'`);
+  await query(`create table if not exists user_brand_subscriptions (
+    user_id bigint unsigned not null comment 'subscriber user id',
+    brand_id bigint unsigned not null comment 'subscribed brand id',
+    created_at datetime not null default current_timestamp comment 'created time',
+    primary key (user_id, brand_id),
+    key idx_user_brand_subscriptions_brand (brand_id),
+    constraint fk_user_brand_subscriptions_user foreign key (user_id) references users (id) on delete cascade,
+    constraint fk_user_brand_subscriptions_brand foreign key (brand_id) references brands (id) on delete cascade
+  ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='user subscribed brands'`);
 }
 
 function badRequest(message) {
@@ -104,6 +146,13 @@ function assertPassword(password) {
   }
 }
 
+function normalizeOptionalEmail(value) {
+  const email = String(value || "").trim();
+  if (!email) return null;
+  if (email.length > 128 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw badRequest("邮箱格式不正确");
+  return email;
+}
+
 function normalizePermissions(permissions) {
   if (!Array.isArray(permissions) || permissions.length === 0) throw badRequest("至少绑定一个权限");
   const codes = [...new Set(permissions.map((item) => permissionCodeByName[item]).filter(Boolean))];
@@ -124,7 +173,7 @@ async function getUserPermissions(userId) {
 
 async function findUserById(userId) {
   const rows = await query(
-    "select id, username, name, status, created_at, updated_at from users where id = ? and deleted_at is null",
+    "select id, username, email, name, status, created_at, updated_at from users where id = ? and deleted_at is null",
     [userId],
   );
   return rows[0] || null;
@@ -190,6 +239,12 @@ function toPositiveInteger(value, label) {
   return number;
 }
 
+function toNonZeroInteger(value, label) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number === 0) throw badRequest(`${label}必须是非0整数`);
+  return number;
+}
+
 function normalizePageLimit(value) {
   const number = Number(value || 50);
   if (!Number.isInteger(number) || number <= 0) return 50;
@@ -213,7 +268,13 @@ function normalizeDateTimeFilter(value, label, boundary = "start") {
   return normalized.length === 16 ? `${normalized}:00` : normalized;
 }
 
-async function listCatalog() {
+async function listCatalog(options = {}) {
+  const filters = ["b.deleted_at is null"];
+  const params = [];
+  if (options.excludeSupplementBrands) {
+    filters.push("b.name <> ?");
+    params.push("流水补录");
+  }
   return query(
     `select b.id as brandId, b.name as brandName, b.sort_order as brandSort,
        p.id as productId, p.name as productName, p.sort_order as productSort,
@@ -224,8 +285,9 @@ async function listCatalog() {
      join products p on p.brand_id = b.id and p.deleted_at is null
      join skus s on s.product_id = p.id and s.deleted_at is null
      left join sku_inventory i on i.sku_id = s.id
-     where b.deleted_at is null
+     where ${filters.join(" and ")}
      order by b.is_hidden, b.sort_order, b.id, p.is_hidden, p.sort_order, p.id, s.is_hidden, s.sort_order, s.id`,
+    params,
   );
 }
 
@@ -236,7 +298,7 @@ app.post("/api/auth/login", async (req, res, next) => {
     const username = assertUsername(req.body.username);
     const password = String(req.body.password || "");
     const rows = await query(
-      "select id, username, name, password_hash, status from users where username = ? and deleted_at is null",
+      "select id, username, email, name, password_hash, status from users where username = ? and deleted_at is null",
       [username],
     );
     const user = rows[0];
@@ -245,7 +307,7 @@ app.post("/api/auth/login", async (req, res, next) => {
       return res.status(401).json({ message: "用户名或密码错误" });
     }
     const permissions = await getUserPermissions(user.id);
-    res.json({ user: { id: user.id, username: user.username, name: user.name, status: user.status, permissions }, permissions, ...signToken(user, permissions) });
+    res.json({ user: { id: user.id, username: user.username, email: user.email || "", name: user.name, status: user.status, permissions }, permissions, ...signToken(user, permissions) });
   } catch (error) {
     next(error);
   }
@@ -257,15 +319,22 @@ app.get("/api/me", requireAuth, (req, res) => res.json({ user: req.user, permiss
 app.get("/api/users", requireAuth, requireSuper, async (_req, res, next) => {
   try {
     const rows = await query(
-      `select u.id, u.username, u.name, u.status, u.created_at as createdAt,
-        group_concat(up.permission_code order by up.permission_code) as permissionCodes
+      `select u.id, u.username, u.email, u.name, u.status, u.created_at as createdAt,
+        group_concat(distinct up.permission_code order by up.permission_code) as permissionCodes,
+        group_concat(distinct ubs.brand_id order by ubs.brand_id) as subscribedBrandIds
        from users u
        left join user_permissions up on up.user_id = u.id
+       left join user_brand_subscriptions ubs on ubs.user_id = u.id
        where u.deleted_at is null
-       group by u.id, u.username, u.name, u.status, u.created_at
+       group by u.id, u.username, u.email, u.name, u.status, u.created_at
        order by u.id`,
     );
-    res.json(rows.map((row) => ({ ...row, permissions: String(row.permissionCodes || "").split(",").filter(Boolean).map((code) => permissionNameByCode[code]) })));
+    res.json(rows.map((row) => ({
+      ...row,
+      email: row.email || "",
+      permissions: String(row.permissionCodes || "").split(",").filter(Boolean).map((code) => permissionNameByCode[code]),
+      subscribedBrandIds: String(row.subscribedBrandIds || "").split(",").filter(Boolean).map(Number),
+    })));
   } catch (error) {
     next(error);
   }
@@ -275,6 +344,7 @@ app.post("/api/users", requireAuth, requireSuper, async (req, res, next) => {
   try {
     const username = assertUsername(req.body.username);
     const name = assertName(req.body.name, "真实姓名");
+    const email = normalizeOptionalEmail(req.body.email);
     const password = String(req.body.password || "");
     assertPassword(password);
     const permissionCodes = normalizePermissions(req.body.permissions);
@@ -282,7 +352,7 @@ app.post("/api/users", requireAuth, requireSuper, async (req, res, next) => {
     const userId = await withTransaction(async (connection) => {
       const [created] = await connection.execute(
         "insert into users(username, email, name, password_hash, status) values(?, ?, ?, ?, 1)",
-        [username, `${username}@fish.local`, name, passwordHash],
+        [username, email, name, passwordHash],
       );
       for (const code of permissionCodes) {
         await connection.execute("insert into user_permissions(user_id, permission_code) values(?, ?)", [created.insertId, code]);
@@ -300,6 +370,7 @@ app.put("/api/users/:id", requireAuth, requireSuper, async (req, res, next) => {
     const userId = Number(req.params.id);
     const username = assertUsername(req.body.username);
     const name = assertName(req.body.name, "真实姓名");
+    const email = normalizeOptionalEmail(req.body.email);
     const status = req.body.status === 0 ? 0 : 1;
     const permissionCodes = normalizePermissions(req.body.permissions);
     const password = String(req.body.password || "");
@@ -308,12 +379,12 @@ app.put("/api/users/:id", requireAuth, requireSuper, async (req, res, next) => {
       if (password) {
         await connection.execute(
           "update users set username = ?, email = ?, name = ?, password_hash = ?, status = ? where id = ?",
-          [username, `${username}@fish.local`, name, await bcrypt.hash(password, 10), status, userId],
+          [username, email, name, await bcrypt.hash(password, 10), status, userId],
         );
       } else {
         await connection.execute("update users set username = ?, email = ?, name = ?, status = ? where id = ?", [
           username,
-          `${username}@fish.local`,
+          email,
           name,
           status,
           userId,
@@ -325,6 +396,33 @@ app.put("/api/users/:id", requireAuth, requireSuper, async (req, res, next) => {
       }
     });
     res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/users/:id/brand-subscriptions", requireAuth, requireSuper, async (req, res, next) => {
+  try {
+    const userId = Number(req.params.id);
+    const targetUser = await findUserById(userId);
+    if (!targetUser) throw badRequest("用户不存在");
+    const targetPermissions = await getUserPermissions(userId);
+    if (!targetPermissions.includes("SUPER")) throw badRequest("只有超级管理员用户可以订阅品牌");
+    const brandIds = [...new Set((Array.isArray(req.body.brandIds) ? req.body.brandIds : []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+    if (brandIds.length) {
+      const rows = await query(
+        `select id from brands where deleted_at is null and id in (${brandIds.map(() => "?").join(",")})`,
+        brandIds,
+      );
+      if (rows.length !== brandIds.length) throw badRequest("订阅品牌参数不合法");
+    }
+    await withTransaction(async (connection) => {
+      await connection.execute("delete from user_brand_subscriptions where user_id = ?", [userId]);
+      for (const brandId of brandIds) {
+        await connection.execute("insert into user_brand_subscriptions(user_id, brand_id) values(?, ?)", [userId, brandId]);
+      }
+    });
+    res.json({ ok: true, subscribedBrandIds: brandIds });
   } catch (error) {
     next(error);
   }
@@ -697,6 +795,83 @@ app.post("/api/inventory/outbound", requireAuth, requireAnyPermission(["INVENTOR
   }
 });
 
+app.post("/api/inventory/abnormal", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
+  try {
+    const skuId = Number(req.body.skuId);
+    if (!Number.isInteger(skuId) || skuId <= 0) throw badRequest("规格不合法");
+    const quantity = toNonZeroInteger(req.body.quantity, "数量");
+    const reason = String(req.body.reason || "").trim();
+    if (!reason) throw badRequest("原因不能为空");
+    if (reason.length > 255) throw badRequest("原因不能超过255个字符");
+
+    const result = await withTransaction(async (connection) => {
+      const [stockRows] = await connection.execute("select salable_qty, unsalable_qty from sku_inventory where sku_id = ? for update", [skuId]);
+      const stock = stockRows[0];
+      if (!stock) throw badRequest("规格库存不存在");
+      const salable = Number(stock.salable_qty) + quantity;
+      const unsalable = Number(stock.unsalable_qty);
+      await connection.execute("update sku_inventory set salable_qty = ? where sku_id = ?", [salable, skuId]);
+      const [created] = await connection.execute(
+        `insert into inventory_abnormal_logs (sku_id, stock_label, quantity, reason, operator_user_id)
+         values(?, 1, ?, ?, ?)`,
+        [skuId, quantity, reason, req.user.id],
+      );
+      return { id: created.insertId, skuId, quantity, salableQty: salable, unsalableQty: unsalable };
+    });
+
+    res.status(201).json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/inventory/logs/:id", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) throw badRequest("日志ID不合法");
+    await withTransaction(async (connection) => {
+      const [logRows] = await connection.execute(
+        `select id, sku_id as skuId, operation_type as operationType, inbound_type as inboundType,
+            stock_label as stockLabel, quantity, simultaneous_inbound as simultaneousInbound,
+            timestampdiff(second, created_at, now()) as ageSeconds
+         from inventory_operation_logs
+         where id = ?
+         for update`,
+        [id],
+      );
+      const log = logRows[0];
+      if (!log) throw badRequest("库存操作记录不存在");
+      if (Number(log.ageSeconds) > 10 * 60) throw badRequest("只能撤销10分钟内的库存操作");
+
+      const [stockRows] = await connection.execute("select salable_qty, unsalable_qty from sku_inventory where sku_id = ? for update", [log.skuId]);
+      const stock = stockRows[0];
+      if (!stock) throw badRequest("规格库存不存在");
+      let salable = Number(stock.salable_qty);
+      let unsalable = Number(stock.unsalable_qty);
+      const quantity = Number(log.quantity);
+      const stockLabel = Number(log.stockLabel);
+      const operationType = Number(log.operationType);
+      const simultaneousInbound = Number(log.simultaneousInbound) === 1;
+
+      if (operationType === 1) {
+        if (stockLabel === 1) salable -= quantity;
+        else unsalable -= quantity;
+      } else if (stockLabel === 1) {
+        salable += quantity;
+      } else {
+        unsalable += quantity;
+        if (simultaneousInbound) salable -= quantity;
+      }
+
+      await connection.execute("update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?", [salable, unsalable, log.skuId]);
+      await connection.execute("delete from inventory_operation_logs where id = ?", [id]);
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 function normalizeFilterId(value, label) {
   if (value === undefined || value === null || value === "") return 0;
   const number = Number(value);
@@ -766,7 +941,8 @@ async function queryInventoryLogs(filters, paging = {}) {
         l.stock_label as stockLabel, l.quantity, l.simultaneous_inbound as simultaneousInbound,
         case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else '' end as platform,
         l.remark, date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt, u.name as operatorName,
-        b.name as brandName, p.name as productName, s.name as skuName
+        b.name as brandName, p.name as productName, s.name as skuName,
+        timestampdiff(second, l.created_at, now()) <= 600 as canRevoke
        ${fromSql}
        order by l.id desc${limitSql}`,
     [...params, ...limitParams],
@@ -784,15 +960,47 @@ app.get("/api/inventory/logs", requireAuth, readScope, async (req, res, next) =>
   }
 });
 
+async function queryInventoryAbnormalLogs(paging = {}) {
+  const fromSql = `from inventory_abnormal_logs l
+       join users u on u.id = l.operator_user_id
+       join skus s on s.id = l.sku_id
+       join products p on p.id = s.product_id
+       join brands b on b.id = p.brand_id`;
+  const [totalRow] = await query(`select count(*) as total ${fromSql}`);
+  const limitSql = paging.limit ? " limit ? offset ?" : "";
+  const limitParams = paging.limit ? [paging.limit, paging.offset || 0] : [];
+  const rows = await query(
+    `select l.id, l.quantity, l.reason, date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt,
+        u.name as operatorName, b.name as brandName, p.name as productName, s.name as skuName
+       ${fromSql}
+       order by l.id desc${limitSql}`,
+    limitParams,
+  );
+  return { rows, total: Number(totalRow?.total || 0) };
+}
+
+app.get("/api/inventory/abnormal-logs", requireAuth, readScope, async (req, res, next) => {
+  try {
+    const limit = normalizePageLimit(req.query.limit);
+    const offset = normalizeOffset(req.query.offset);
+    res.json(await queryInventoryAbnormalLogs({ limit, offset }));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/inventory/checks", requireAuth, readScope, async (_req, res, next) => {
   try {
     res.json(await query(
       `select c.id, date_format(c.check_time, '%Y-%m-%d %H:%i:%s') as checkTime,
-          u.name as operatorName, c.upload_file_path as uploadFilePath, count(d.id) as differenceCount
+          u.name as operatorName, c.upload_file_path as uploadFilePath,
+          c.is_synced as isSynced, date_format(c.synced_at, '%Y-%m-%d %H:%i:%s') as syncedAt,
+          if(c.is_synced = 0 and timestampdiff(minute, c.check_time, now()) <= 30, 1, 0) as canSync,
+          count(d.id) as differenceCount
        from inventory_checks c
        join users u on u.id = c.operator_user_id
        left join inventory_check_differences d on d.check_id = c.id
-       group by c.id, c.check_time, u.name, c.upload_file_path
+       group by c.id, c.check_time, u.name, c.upload_file_path, c.is_synced, c.synced_at
        order by c.id desc`,
     ));
   } catch (error) {
@@ -811,6 +1019,74 @@ app.get("/api/inventory/checks/:id(\\d+)", requireAuth, readScope, async (req, r
   }
 });
 
+app.post("/api/inventory/checks/:id(\\d+)/sync", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
+  try {
+    const checkId = Number(req.params.id);
+    if (!Number.isInteger(checkId) || checkId <= 0) throw badRequest("盘点记录ID不合法");
+    await withTransaction(async (connection) => {
+      const [recordRows] = await connection.execute(
+        `select id, is_synced as isSynced, timestampdiff(minute, check_time, now()) as ageMinutes
+         from inventory_checks
+         where id = ?
+         for update`,
+        [checkId],
+      );
+      const record = recordRows[0];
+      if (!record) throw badRequest("盘点记录不存在");
+      if (Number(record.isSynced) === 1) throw badRequest("本次盘点差异已经同步过");
+      if (Number(record.ageMinutes) > 30) throw badRequest("只能同步30分钟内的盘点差异");
+
+      const [differences] = await connection.execute(
+        `select sku_id as skuId, salable_diff_qty as salableDiffQty, unsalable_diff_qty as unsalableDiffQty
+         from inventory_check_differences
+         where check_id = ?
+         order by id`,
+        [checkId],
+      );
+
+      for (const difference of differences) {
+        const salableDiffQty = Number(difference.salableDiffQty || 0);
+        const unsalableDiffQty = Number(difference.unsalableDiffQty || 0);
+        if (salableDiffQty === 0 && unsalableDiffQty === 0) continue;
+        const [stockRows] = await connection.execute(
+          "select salable_qty, unsalable_qty from sku_inventory where sku_id = ? for update",
+          [difference.skuId],
+        );
+        const stock = stockRows[0];
+        if (!stock) throw badRequest("规格库存不存在");
+        await connection.execute(
+          "update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?",
+          [
+            Number(stock.salable_qty) + salableDiffQty,
+            Number(stock.unsalable_qty) + unsalableDiffQty,
+            difference.skuId,
+          ],
+        );
+        if (salableDiffQty !== 0) {
+          await connection.execute(
+            `insert into inventory_abnormal_logs (sku_id, stock_label, quantity, reason, operator_user_id)
+             values(?, 1, ?, ?, ?)`,
+            [difference.skuId, salableDiffQty, "库存盘点异常同步", req.user.id],
+          );
+        }
+        if (unsalableDiffQty !== 0) {
+          await connection.execute(
+            `insert into inventory_abnormal_logs (sku_id, stock_label, quantity, reason, operator_user_id)
+             values(?, 2, ?, ?, ?)`,
+            [difference.skuId, unsalableDiffQty, "库存盘点异常同步", req.user.id],
+          );
+        }
+      }
+
+      await connection.execute("update inventory_checks set is_synced = 1, synced_at = now() where id = ?", [checkId]);
+    });
+
+    res.json({ record: await getInventoryCheckRecord(checkId), rows: await listInventoryCheckDifferences(checkId) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/inventory/checks/:id(\\d+)/file", requireAuth, readScope, async (req, res, next) => {
   try {
     const record = await getInventoryCheckRecord(Number(req.params.id));
@@ -823,6 +1099,20 @@ app.get("/api/inventory/checks/:id(\\d+)/file", requireAuth, readScope, async (r
     res.download(absolutePath, `盘点数据-${record.checkTime.replace(/[^\d]/g, "").slice(0, 14)}${path.extname(absolutePath) || ".xlsx"}`);
   } catch (error) {
     if (error.code === "ENOENT") return res.status(404).json({ message: "上传文件不存在" });
+    next(error);
+  }
+});
+
+app.get("/api/inventory/checks/:id(\\d+)/export", requireAuth, readScope, async (req, res, next) => {
+  try {
+    const record = await getInventoryCheckRecord(Number(req.params.id));
+    if (!record) return res.status(404).json({ message: "盘点记录不存在" });
+    const workbook = await buildInventoryCheckDifferenceWorkbook(record.id);
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=inventory-check-detail.xlsx");
+    res.send(Buffer.from(buffer));
+  } catch (error) {
     next(error);
   }
 });
@@ -1001,28 +1291,79 @@ app.get("/api/stats/sales/trend", requireAuth, readScope, async (req, res, next)
   }
 });
 
+function normalizeSalesAmountDateRange(source) {
+  const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(source.startDate || ""))
+    ? String(source.startDate)
+    : dateKey(new Date(Date.now() - 6 * 24 * 60 * 60 * 1000));
+  const endDate = /^\d{4}-\d{2}-\d{2}$/.test(String(source.endDate || ""))
+    ? String(source.endDate)
+    : dateKey(new Date());
+  return { startDate, endDate };
+}
+
+async function querySalesAmountRows(filters) {
+  const { startDate, endDate } = normalizeSalesAmountDateRange(filters);
+  const rows = await query(
+    `select b.id as brandId, b.name as brandName,
+      p.id as productId, p.name as productName,
+      s.id as skuId, s.name as skuName, s.purchase_price as purchasePrice,
+      sum(case when l.operation_type = 2 then l.quantity else -l.quantity end) as salesQty,
+      sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as costAmount
+     from inventory_operation_logs l
+     join skus s on s.id = l.sku_id
+     join products p on p.id = s.product_id
+     join brands b on b.id = p.brand_id
+     where (l.operation_type = 2 or (l.operation_type = 1 and l.inbound_type = 2))
+       and l.created_at >= ? and l.created_at < date_add(?, interval 1 day)
+     group by b.id, b.name, b.sort_order, p.id, p.name, p.sort_order, s.id, s.name, s.sort_order, s.purchase_price
+     order by b.sort_order, b.id, p.sort_order, p.id, s.sort_order, s.id`,
+    [startDate, endDate],
+  );
+  const platformRows = await query(
+    `select b.id as brandId,
+       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else 'none' end as platform,
+       sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as amount
+     from inventory_operation_logs l
+     join skus s on s.id = l.sku_id
+     join products p on p.id = s.product_id
+     join brands b on b.id = p.brand_id
+     where (l.operation_type = 2 or (l.operation_type = 1 and l.inbound_type = 2))
+       and l.created_at >= ? and l.created_at < date_add(?, interval 1 day)
+     group by b.id, platform`,
+    [startDate, endDate],
+  );
+  const platformAmounts = new Map();
+  for (const row of platformRows) {
+    const current = platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, none: 0 };
+    current[row.platform] = Number(row.amount || 0);
+    platformAmounts.set(row.brandId, current);
+  }
+  return rows.map((row) => ({
+    ...row,
+    brandPlatformAmounts: platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, none: 0 },
+  }));
+}
+
+async function querySalesAmountPlatformBreakdown(filters) {
+  const { startDate, endDate } = normalizeSalesAmountDateRange(filters);
+  return query(
+    `select b.id as brandId, p.id as productId, s.id as skuId,
+       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else 'none' end as platform,
+       sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as amount
+     from inventory_operation_logs l
+     join skus s on s.id = l.sku_id
+     join products p on p.id = s.product_id
+     join brands b on b.id = p.brand_id
+     where (l.operation_type = 2 or (l.operation_type = 1 and l.inbound_type = 2))
+       and l.created_at >= ? and l.created_at < date_add(?, interval 1 day)
+     group by b.id, p.id, s.id, platform`,
+    [startDate, endDate],
+  );
+}
+
 app.get("/api/stats/sales/amount", requireAuth, readScope, async (req, res, next) => {
   try {
-    const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.startDate || "")) ? String(req.query.startDate) : dateKey(new Date(Date.now() - 6 * 24 * 60 * 60 * 1000));
-    const endDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.endDate || "")) ? String(req.query.endDate) : dateKey(new Date());
-    res.json(
-      await query(
-        `select b.id as brandId, b.name as brandName,
-          p.id as productId, p.name as productName,
-          s.id as skuId, s.name as skuName, s.purchase_price as purchasePrice,
-          sum(case when l.operation_type = 2 then l.quantity else -l.quantity end) as salesQty,
-          sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as costAmount
-         from inventory_operation_logs l
-         join skus s on s.id = l.sku_id
-         join products p on p.id = s.product_id
-         join brands b on b.id = p.brand_id
-         where (l.operation_type = 2 or (l.operation_type = 1 and l.inbound_type = 2))
-           and l.created_at >= ? and l.created_at < date_add(?, interval 1 day)
-         group by b.id, b.name, b.sort_order, p.id, p.name, p.sort_order, s.id, s.name, s.sort_order, s.purchase_price
-         order by b.sort_order, b.id, p.sort_order, p.id, s.sort_order, s.id`,
-        [startDate, endDate],
-      ),
-    );
+    res.json(await querySalesAmountRows(req.query));
   } catch (error) {
     next(error);
   }
@@ -1243,6 +1584,7 @@ function worksheetRowsWithMergedNames(workbook, name) {
 }
 
 function parseInventoryCountNumber(value, label, rowNumber) {
+  if (value === null || value === undefined || value === "") return 0;
   if (value === null || value === undefined || value === "") throw badRequest(`第${rowNumber}行${label}不能为空`);
   const numberValue = Number(value);
   if (!Number.isInteger(numberValue)) throw badRequest(`第${rowNumber}行${label}必须是整数`);
@@ -1262,19 +1604,22 @@ async function saveInventoryCheckUploadFile(file) {
 async function buildInventoryCheckTemplateWorkbook() {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "fish-cms";
-  addInventoryCheckTemplateSheet(workbook, await listCatalog());
+  addInventoryCheckTemplateSheet(workbook, await listCatalog({ excludeSupplementBrands: true }));
   return workbook;
 }
 
 async function getInventoryCheckRecord(checkId) {
   const rows = await query(
     `select c.id, date_format(c.check_time, '%Y-%m-%d %H:%i:%s') as checkTime,
-        u.name as operatorName, c.upload_file_path as uploadFilePath, count(d.id) as differenceCount
+        u.name as operatorName, c.upload_file_path as uploadFilePath,
+        c.is_synced as isSynced, date_format(c.synced_at, '%Y-%m-%d %H:%i:%s') as syncedAt,
+        if(c.is_synced = 0 and timestampdiff(minute, c.check_time, now()) <= 30, 1, 0) as canSync,
+        count(d.id) as differenceCount
      from inventory_checks c
      join users u on u.id = c.operator_user_id
      left join inventory_check_differences d on d.check_id = c.id
      where c.id = ?
-     group by c.id, c.check_time, u.name, c.upload_file_path`,
+     group by c.id, c.check_time, u.name, c.upload_file_path, c.is_synced, c.synced_at`,
     [checkId],
   );
   return rows[0] || null;
@@ -1282,17 +1627,21 @@ async function getInventoryCheckRecord(checkId) {
 
 async function listInventoryCheckDifferences(checkId) {
   return query(
-    `select id, check_id as checkId, sku_id as skuId,
+    `select d.id, d.check_id as checkId, d.sku_id as skuId,
         brand_name as brandName, product_name as productName, sku_name as skuName,
         system_salable_qty as systemSalableQty,
         system_unsalable_qty as systemUnsalableQty,
         actual_salable_qty as actualSalableQty,
         actual_unsalable_qty as actualUnsalableQty,
         salable_diff_qty as salableDiffQty,
-        unsalable_diff_qty as unsalableDiffQty
-     from inventory_check_differences
-     where check_id = ?
-     order by id`,
+        unsalable_diff_qty as unsalableDiffQty,
+        coalesce(nullif(d.purchase_price_snapshot, 0), s.purchase_price, 0) as purchasePrice,
+        salable_diff_qty * coalesce(nullif(d.purchase_price_snapshot, 0), s.purchase_price, 0) as salableDiffAmount,
+        unsalable_diff_qty * coalesce(nullif(d.purchase_price_snapshot, 0), s.purchase_price, 0) as unsalableDiffAmount
+     from inventory_check_differences d
+     left join skus s on s.id = d.sku_id
+     where d.check_id = ?
+     order by d.id`,
     [checkId],
   );
 }
@@ -1331,6 +1680,7 @@ async function importInventoryCheckWorkbook(buffer, operatorUserId, uploadFilePa
         actualUnsalableQty,
         salableDiffQty,
         unsalableDiffQty,
+        purchasePrice: Number(catalogRow.purchasePrice),
       });
     }
   }
@@ -1345,8 +1695,8 @@ async function importInventoryCheckWorkbook(buffer, operatorUserId, uploadFilePa
         `insert into inventory_check_differences
           (check_id, sku_id, brand_name, product_name, sku_name,
            system_salable_qty, system_unsalable_qty, actual_salable_qty, actual_unsalable_qty,
-           salable_diff_qty, unsalable_diff_qty)
-         values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           salable_diff_qty, unsalable_diff_qty, purchase_price_snapshot)
+         values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           created.insertId,
           item.skuId,
@@ -1359,6 +1709,7 @@ async function importInventoryCheckWorkbook(buffer, operatorUserId, uploadFilePa
           item.actualUnsalableQty,
           item.salableDiffQty,
           item.unsalableDiffQty,
+          item.purchasePrice,
         ],
       );
     }
@@ -1406,8 +1757,343 @@ function addInventoryLogsSheet(workbook, logs) {
 async function buildInventoryDetailWorkbook() {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "fish-cms";
-  addInventoryDetailSheet(workbook, await listCatalog());
+  addInventoryDetailSheet(workbook, await listCatalog({ excludeSupplementBrands: true }));
   return workbook;
+}
+
+async function buildInventoryAmountWorkbook() {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  const rows = (await listCatalog()).map((row) => {
+    const quantity = Number(row.salableQty) + Number(row.unsalableQty);
+    const amount = quantity * Number(row.purchasePrice);
+    return { ...row, quantity, amount };
+  });
+  const productTotals = new Map();
+  const brandTotals = new Map();
+  for (const row of rows) {
+    productTotals.set(row.productId, (productTotals.get(row.productId) || 0) + row.amount);
+    brandTotals.set(row.brandId, (brandTotals.get(row.brandId) || 0) + row.amount);
+  }
+  const sheet = addRowsSheet(
+    workbook,
+    "库存金额",
+    ["品牌名", "商品名", "规格名", "库存总量", "库存金额", "商品总金额", "品牌总金额"],
+    rows.map((row) => ({
+      values: [
+        row.brandName,
+        row.productName,
+        row.skuName,
+        row.quantity,
+        row.amount,
+        productTotals.get(row.productId) || 0,
+        brandTotals.get(row.brandId) || 0,
+      ],
+    })),
+  );
+  for (let rowNumber = 2; rowNumber <= rows.length + 1; rowNumber += 1) {
+    for (const columnNumber of [5, 6, 7]) {
+      sheet.getCell(rowNumber, columnNumber).numFmt = '"¥"#,##0.00;-"¥"#,##0.00';
+    }
+  }
+  if (rows.length) {
+    mergeSame(sheet, 2, rows.length + 1, [1, 7], (row) => sheet.getCell(row, 1).value);
+    mergeSame(sheet, 2, rows.length + 1, [2, 6], (row) => `${sheet.getCell(row, 1).value}-${sheet.getCell(row, 2).value}`);
+  }
+  autoWidth(sheet);
+  return workbook;
+}
+
+function getZonedDateParts(date = new Date(), timeZone = process.env.SCHEDULE_TIME_ZONE || "Asia/Shanghai") {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const map = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, Number(part.value)]));
+  return { year: map.year, month: map.month, day: map.day, hour: map.hour, minute: map.minute };
+}
+
+function isMonthlyInventoryEmailDue(date = new Date()) {
+  const parts = getZonedDateParts(date);
+  const lastDay = new Date(Date.UTC(parts.year, parts.month, 0)).getUTCDate();
+  return parts.day === lastDay && parts.hour === 22;
+}
+
+function formatMonthlyInventoryJobKey(date = new Date()) {
+  const parts = getZonedDateParts(date);
+  return `monthly-inventory-amount-${parts.year}-${String(parts.month).padStart(2, "0")}`;
+}
+
+function formatMonthlyInventoryFileName(date = new Date()) {
+  const parts = getZonedDateParts(date);
+  return `${parts.year}年${parts.month}月${parts.day}日${parts.hour}时${String(parts.minute).padStart(2, "0")}分_库存金额.xlsx`;
+}
+
+function formatDateOnly(parts) {
+  return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
+function getTodayDateRange(date = new Date()) {
+  const parts = getZonedDateParts(date);
+  const dateText = formatDateOnly(parts);
+  return { dateText, startAt: `${dateText} 00:00:00`, endAt: `${dateText} 23:59:59`, parts };
+}
+
+function isDailySalesEmailDue(date = new Date()) {
+  const parts = getZonedDateParts(date);
+  return parts.hour === 21;
+}
+
+async function claimScheduledEmailJob(jobKey, jobType = "monthly_inventory_amount_email") {
+  const rows = await query("select status, timestampdiff(minute, updated_at, now()) as runningMinutes from scheduled_email_jobs where job_key = ?", [jobKey]);
+  if (rows[0]?.status === 2) return false;
+  if (rows[0]?.status === 1 && Number(rows[0]?.runningMinutes || 0) < 30) return false;
+  if (rows.length === 0) {
+    await query(
+      "insert into scheduled_email_jobs(job_key, job_type, status, run_at) values(?, ?, 1, now())",
+      [jobKey, jobType],
+    );
+    return true;
+  }
+  await query("update scheduled_email_jobs set status = 1, message = '' where job_key = ?", [jobKey]);
+  return true;
+}
+
+async function updateScheduledEmailJob(jobKey, status, recipients, message) {
+  await query(
+    "update scheduled_email_jobs set status = ?, sent_at = if(? = 2, now(), sent_at), recipients = ?, message = ? where job_key = ?",
+    [status, status, recipients, String(message || "").slice(0, 500), jobKey],
+  );
+}
+
+async function findFinanceEmailRecipients() {
+  return query(
+    `select distinct u.email
+     from users u
+     join user_permissions up on up.user_id = u.id
+     join permissions p on p.code = up.permission_code
+     where u.deleted_at is null
+       and u.status = 1
+       and p.name = 'FINANCE'
+       and u.email is not null
+       and u.email <> ''
+     order by u.id`,
+  );
+}
+
+async function findBrandSalesSubscribers() {
+  const rows = await query(
+    `select u.id, u.name, u.email, group_concat(ubs.brand_id order by b.sort_order, b.id) as brandIds
+     from users u
+     join user_brand_subscriptions ubs on ubs.user_id = u.id
+     join brands b on b.id = ubs.brand_id and b.deleted_at is null
+     where u.deleted_at is null
+       and u.status = 1
+       and u.email is not null
+       and u.email <> ''
+     group by u.id, u.name, u.email
+     order by u.id`,
+  );
+  return rows.map((row) => ({
+    ...row,
+    brandIds: String(row.brandIds || "").split(",").filter(Boolean).map(Number),
+  })).filter((row) => row.brandIds.length > 0);
+}
+
+async function queryDailyBrandProductRows(brandIds, startAt, endAt, mode) {
+  if (!brandIds.length) return [];
+  const params = [...brandIds, startAt, endAt];
+  const typeFilter = mode === "return" ? "l.operation_type = 1 and l.inbound_type = 2" : "l.operation_type = 2";
+  return query(
+    `select b.id as brandId, b.name as brandName, p.id as productId, p.name as productName,
+       sum(l.quantity) as quantity,
+       sum(l.quantity * s.purchase_price) as amount
+     from inventory_operation_logs l
+     join skus s on s.id = l.sku_id
+     join products p on p.id = s.product_id
+     join brands b on b.id = p.brand_id
+     where b.id in (${brandIds.map(() => "?").join(",")})
+       and ${typeFilter}
+       and l.created_at between ? and ?
+     group by b.id, b.name, p.id, p.name
+     order by b.sort_order, b.id, p.sort_order, p.id`,
+    params,
+  );
+}
+
+function withBrandAndGrandTotals(rows) {
+  const brandTotals = new Map();
+  let grandTotal = 0;
+  for (const row of rows) {
+    const amount = Number(row.amount || 0);
+    brandTotals.set(row.brandId, (brandTotals.get(row.brandId) || 0) + amount);
+    grandTotal += amount;
+  }
+  return rows.map((row) => ({
+    ...row,
+    quantity: Number(row.quantity || 0),
+    amount: Number(row.amount || 0),
+    brandTotalAmount: brandTotals.get(row.brandId) || 0,
+    grandTotalAmount: grandTotal,
+  }));
+}
+
+function addDailySalesSheet(workbook, name, rows, quantityTitle = "销售数量", amountTitle = "销售金额") {
+  const sheet = addRowsSheet(
+    workbook,
+    name,
+    ["品牌名", "商品名", quantityTitle, amountTitle, "品牌总金额", "所有品牌销售总金额"],
+    rows.length ? rows.map((row) => ({
+      values: [row.brandName, row.productName, row.quantity, row.amount, row.brandTotalAmount, row.grandTotalAmount],
+    })) : [{ values: ["无数据", "", 0, 0, 0, 0] }],
+  );
+  for (let rowNumber = 2; rowNumber <= Math.max(rows.length, 1) + 1; rowNumber += 1) {
+    for (const columnNumber of [4, 5, 6]) {
+      sheet.getCell(rowNumber, columnNumber).numFmt = '"¥"#,##0.00;-"¥"#,##0.00';
+    }
+  }
+  if (rows.length) {
+    mergeSame(sheet, 2, rows.length + 1, [1, 5], (row) => sheet.getCell(row, 1).value);
+    mergeSame(sheet, 2, rows.length + 1, [6], () => "grand-total");
+  }
+  autoWidth(sheet);
+  return sheet;
+}
+
+function buildDailySalesWorkbook({ salesRows, returnRows, dateText }) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  workbook.created = new Date();
+  addDailySalesSheet(workbook, `${dateText}销售`, salesRows, "销售数量", "销售金额");
+  addDailySalesSheet(workbook, `${dateText}退货`, returnRows, "退货数量", "退货金额");
+  return workbook;
+}
+
+function htmlEscape(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+}
+
+function renderDailySalesHtmlTable(title, rows, quantityTitle = "销售数量", amountTitle = "销售金额") {
+  const body = rows.length
+    ? rows.map((row) => `<tr><td>${htmlEscape(row.brandName)}</td><td>${htmlEscape(row.productName)}</td><td>${row.quantity}</td><td>¥${Number(row.amount).toFixed(2)}</td><td>¥${Number(row.brandTotalAmount).toFixed(2)}</td><td>¥${Number(row.grandTotalAmount).toFixed(2)}</td></tr>`).join("")
+    : "<tr><td colspan=\"6\">无数据</td></tr>";
+  return `<h3>${htmlEscape(title)}</h3><table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;font-size:13px;"><thead><tr><th>品牌名</th><th>商品名</th><th>${htmlEscape(quantityTitle)}</th><th>${htmlEscape(amountTitle)}</th><th>品牌总金额</th><th>所有品牌销售总金额</th></tr></thead><tbody>${body}</tbody></table>`;
+}
+
+async function sendDailySalesSubscriptionEmail(subscriber, dateRange) {
+  const salesRows = withBrandAndGrandTotals(await queryDailyBrandProductRows(subscriber.brandIds, dateRange.startAt, dateRange.endAt, "sales"));
+  const returnRows = withBrandAndGrandTotals(await queryDailyBrandProductRows(subscriber.brandIds, dateRange.startAt, dateRange.endAt, "return"));
+  const workbook = buildDailySalesWorkbook({ salesRows, returnRows, dateText: dateRange.dateText });
+  const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
+  const { default: nodemailer } = await import("nodemailer");
+  const portNumber = Number(process.env.SMTP_PORT || 465);
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: portNumber,
+    secure: String(process.env.SMTP_SECURE || (portNumber === 465 ? "true" : "false")).toLowerCase() === "true",
+    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS || "" } : undefined,
+  });
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: subscriber.email,
+    subject: `${dateRange.dateText} 品牌销售日报`,
+    html: `<p>${htmlEscape(subscriber.name)}，附件为今日订阅品牌销售日报。</p>${renderDailySalesHtmlTable("今日销售数据", salesRows, "销售数量", "销售金额")}<br/>${renderDailySalesHtmlTable("今日退货数据", returnRows, "退货数量", "退货金额")}`,
+    attachments: [{
+      filename: `${dateRange.dateText}_品牌销售日报.xlsx`,
+      content: buffer,
+      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }],
+  });
+  return { salesRows, returnRows };
+}
+
+async function sendMonthlyInventoryAmountEmail(jobKey) {
+  if (!process.env.SMTP_HOST) {
+    await updateScheduledEmailJob(jobKey, 3, "", "SMTP_HOST is not configured");
+    console.warn("[monthly-inventory-email] SMTP_HOST is not configured");
+    return;
+  }
+  const recipients = (await findFinanceEmailRecipients()).map((row) => row.email).filter(Boolean);
+  if (recipients.length === 0) {
+    await updateScheduledEmailJob(jobKey, 3, "", "No FINANCE users with email");
+    console.warn("[monthly-inventory-email] No FINANCE users with email");
+    return;
+  }
+
+  const { default: nodemailer } = await import("nodemailer");
+  const portNumber = Number(process.env.SMTP_PORT || 465);
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: portNumber,
+    secure: String(process.env.SMTP_SECURE || (portNumber === 465 ? "true" : "false")).toLowerCase() === "true",
+    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS || "" } : undefined,
+  });
+
+  const workbook = await buildInventoryAmountWorkbook();
+  const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
+  const fileName = formatMonthlyInventoryFileName();
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: recipients.join(","),
+    subject: "库存金额月度报表",
+    text: "附件为本月月末库存金额 Excel 报表。",
+    attachments: [{ filename: fileName, content: buffer, contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }],
+  });
+  await updateScheduledEmailJob(jobKey, 2, recipients.join(","), "sent");
+  console.log(`[monthly-inventory-email] sent ${fileName} to ${recipients.join(",")}`);
+}
+
+async function checkMonthlyInventoryAmountEmailJob() {
+  if (String(process.env.INVENTORY_AMOUNT_EMAIL_ENABLED || "true").toLowerCase() === "false") return;
+  if (!isMonthlyInventoryEmailDue()) return;
+  const jobKey = formatMonthlyInventoryJobKey();
+  if (!(await claimScheduledEmailJob(jobKey))) return;
+  try {
+    await sendMonthlyInventoryAmountEmail(jobKey);
+  } catch (error) {
+    await updateScheduledEmailJob(jobKey, 3, "", error.message || "send failed");
+    console.error("[monthly-inventory-email] failed", error);
+  }
+}
+
+async function checkDailySalesSubscriptionEmailJob() {
+  if (String(process.env.DAILY_SALES_EMAIL_ENABLED || "true").toLowerCase() === "false") return;
+  if (!isDailySalesEmailDue()) return;
+  if (!process.env.SMTP_HOST) {
+    console.warn("[daily-sales-email] SMTP_HOST is not configured");
+    return;
+  }
+  const dateRange = getTodayDateRange();
+  const subscribers = await findBrandSalesSubscribers();
+  for (const subscriber of subscribers) {
+    const jobKey = `daily-sales-subscription-${dateRange.dateText}-user-${subscriber.id}`;
+    if (!(await claimScheduledEmailJob(jobKey, "daily_sales_subscription_email"))) continue;
+    try {
+      await sendDailySalesSubscriptionEmail(subscriber, dateRange);
+      await updateScheduledEmailJob(jobKey, 2, subscriber.email, "sent");
+      console.log(`[daily-sales-email] sent ${dateRange.dateText} to ${subscriber.email}`);
+    } catch (error) {
+      await updateScheduledEmailJob(jobKey, 3, subscriber.email, error.message || "send failed");
+      console.error("[daily-sales-email] failed", error);
+    }
+  }
+}
+
+function startMonthlyInventoryAmountEmailJob() {
+  if (String(process.env.INVENTORY_AMOUNT_EMAIL_ENABLED || "true").toLowerCase() === "false") return;
+  setTimeout(() => void checkMonthlyInventoryAmountEmailJob(), 5000);
+  setInterval(() => void checkMonthlyInventoryAmountEmailJob(), 60 * 1000);
+}
+
+function startDailySalesSubscriptionEmailJob() {
+  if (String(process.env.DAILY_SALES_EMAIL_ENABLED || "true").toLowerCase() === "false") return;
+  setTimeout(() => void checkDailySalesSubscriptionEmailJob(), 7000);
+  setInterval(() => void checkDailySalesSubscriptionEmailJob(), 60 * 1000);
 }
 
 async function buildInventoryLogsWorkbook(filters) {
@@ -1415,6 +2101,130 @@ async function buildInventoryLogsWorkbook(filters) {
   workbook.creator = "fish-cms";
   const { rows } = await queryInventoryLogs(filters);
   addInventoryLogsSheet(workbook, rows);
+  return workbook;
+}
+
+async function buildInventoryCheckDifferenceWorkbook(checkId) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  const rows = await listInventoryCheckDifferences(checkId);
+  const sheet = addRowsSheet(
+    workbook,
+    "盘点详情",
+    ["品牌名", "商品名", "规格名", "可售库存数", "不可售库存数", "实际可售库存数", "实际不可售库存数", "可售库存数差值", "可售差值金额", "不可售库存数差值", "不可售差值金额"],
+    rows.map((row) => ({
+      values: [
+        row.brandName,
+        row.productName,
+        row.skuName,
+        Number(row.systemSalableQty),
+        Number(row.systemUnsalableQty),
+        Number(row.actualSalableQty),
+        Number(row.actualUnsalableQty),
+        Number(row.salableDiffQty),
+        Number(row.salableDiffAmount),
+        Number(row.unsalableDiffQty),
+        Number(row.unsalableDiffAmount),
+      ],
+    })),
+  );
+  for (let rowNumber = 2; rowNumber <= rows.length + 1; rowNumber += 1) {
+    for (const columnNumber of [9, 11]) {
+      sheet.getCell(rowNumber, columnNumber).numFmt = '"¥"#,##0.00;-"¥"#,##0.00';
+    }
+    for (const columnNumber of [8, 9]) {
+      const value = Number(sheet.getCell(rowNumber, columnNumber).value || 0);
+      if (value > 0) sheet.getCell(rowNumber, columnNumber).font = { color: { argb: "FF15803D" }, bold: true };
+      if (value < 0) sheet.getCell(rowNumber, columnNumber).font = { color: { argb: "FFB91C1C" }, bold: true };
+    }
+    for (const columnNumber of [10, 11]) {
+      const value = Number(sheet.getCell(rowNumber, columnNumber).value || 0);
+      if (value > 0) sheet.getCell(rowNumber, columnNumber).font = { color: { argb: "FF15803D" }, bold: true };
+      if (value < 0) sheet.getCell(rowNumber, columnNumber).font = { color: { argb: "FFB91C1C" }, bold: true };
+    }
+  }
+  if (rows.length) {
+    mergeSame(sheet, 2, rows.length + 1, [1], (row) => sheet.getCell(row, 1).value);
+    mergeSame(sheet, 2, rows.length + 1, [2], (row) => `${sheet.getCell(row, 1).value}-${sheet.getCell(row, 2).value}`);
+  }
+  autoWidth(sheet);
+  return workbook;
+}
+
+async function buildSalesAmountWorkbook(filters) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  const rows = await querySalesAmountRows(filters);
+  const platformRows = await querySalesAmountPlatformBreakdown(filters);
+  const productTotals = new Map();
+  const brandTotals = new Map();
+  const skuPlatformTotals = new Map();
+  const productPlatformTotals = new Map();
+  const brandPlatformTotals = new Map();
+  const addPlatformAmount = (map, key, platform, amount) => {
+    const current = map.get(key) || { douyin: 0, pinduoduo: 0, none: 0 };
+    current[platform] = (current[platform] || 0) + Number(amount || 0);
+    map.set(key, current);
+  };
+  for (const row of rows) {
+    const amount = Number(row.costAmount);
+    productTotals.set(row.productId, (productTotals.get(row.productId) || 0) + amount);
+    brandTotals.set(row.brandId, (brandTotals.get(row.brandId) || 0) + amount);
+  }
+  for (const row of platformRows) {
+    addPlatformAmount(skuPlatformTotals, row.skuId, row.platform, row.amount);
+    addPlatformAmount(productPlatformTotals, row.productId, row.platform, row.amount);
+    addPlatformAmount(brandPlatformTotals, row.brandId, row.platform, row.amount);
+  }
+  const platformText = (amounts) => {
+    const source = amounts || { douyin: 0, pinduoduo: 0, none: 0 };
+    const lines = [
+      ["拼多多", source.pinduoduo || 0],
+      ["抖音", source.douyin || 0],
+    ];
+    if (Number(source.none || 0) !== 0) lines.push(["未选择", source.none || 0]);
+    return lines.map(([label, amount]) => `${label}：¥${Number(amount).toFixed(2)}`).join("\n");
+  };
+  const sheet = addRowsSheet(
+    workbook,
+    "销售金额",
+    ["品牌名", "商品名", "规格名", "销售数量", "成本金额", "规格-平台细分", "商品总金额", "商品-平台细分", "品牌总金额", "品牌-平台细分"],
+    rows.map((row) => ({
+      values: [
+        row.brandName,
+        row.productName,
+        row.skuName,
+        Number(row.salesQty),
+        Number(row.costAmount),
+        platformText(skuPlatformTotals.get(row.skuId)),
+        productTotals.get(row.productId) || 0,
+        platformText(productPlatformTotals.get(row.productId)),
+        brandTotals.get(row.brandId) || 0,
+        platformText(brandPlatformTotals.get(row.brandId)),
+      ],
+    })),
+  );
+  for (let rowNumber = 2; rowNumber <= rows.length + 1; rowNumber += 1) {
+    for (const columnNumber of [5, 7, 9]) {
+      sheet.getCell(rowNumber, columnNumber).numFmt = '"¥"#,##0.00;-"¥"#,##0.00';
+    }
+    for (const columnNumber of [6, 8, 10]) {
+      sheet.getCell(rowNumber, columnNumber).alignment = { vertical: "middle", horizontal: "left", wrapText: true };
+    }
+  }
+  if (rows.length) {
+    mergeSame(sheet, 2, rows.length + 1, [1, 9, 10], (row) => sheet.getCell(row, 1).value);
+    mergeSame(sheet, 2, rows.length + 1, [2, 7, 8], (row) => `${sheet.getCell(row, 1).value}-${sheet.getCell(row, 2).value}`);
+    for (let rowNumber = 2; rowNumber <= rows.length + 1; rowNumber += 1) {
+      for (const columnNumber of [6, 8, 10]) {
+        sheet.getCell(rowNumber, columnNumber).alignment = { vertical: "middle", horizontal: "left", wrapText: true };
+      }
+    }
+  }
+  autoWidth(sheet);
+  sheet.getColumn(6).width = Math.max(sheet.getColumn(6).width || 12, 18);
+  sheet.getColumn(8).width = Math.max(sheet.getColumn(8).width || 12, 18);
+  sheet.getColumn(10).width = Math.max(sheet.getColumn(10).width || 12, 18);
   return workbook;
 }
 
@@ -1507,7 +2317,7 @@ function buildImportSql(workbook) {
   const lines = ["-- 由导入 Excel 生成，请执行前人工确认。", "-- 导入用户默认密码为 a000001，请上线后及时修改。", "start transaction;"];
   for (const row of sheetRows(workbook, "用户管理")) {
     const permissions = String(row["权限"] || "").split("、").filter(Boolean);
-    lines.push(`insert into users(username, email, name, password_hash, status) values(${sqlValue(row["英文用户名"])}, concat(${sqlValue(row["英文用户名"])}, '@fish.local'), ${sqlValue(row["真实姓名"])}, ${sqlValue(defaultPasswordHash)}, 1) on duplicate key update name = values(name), deleted_at = null;`);
+    lines.push(`insert into users(username, email, name, password_hash, status) values(${sqlValue(row["英文用户名"])}, ${sqlValue(row["邮箱"] || "")}, ${sqlValue(row["真实姓名"])}, ${sqlValue(defaultPasswordHash)}, 1) on duplicate key update email = values(email), name = values(name), deleted_at = null;`);
     for (const permission of permissions) {
       lines.push(`insert ignore into user_permissions(user_id, permission_code) select u.id, p.code from users u join permissions p on p.name = ${sqlValue(permission)} where u.username = ${sqlValue(row["英文用户名"])};`);
     }
@@ -1559,12 +2369,36 @@ app.get("/api/excel/export/inventory-detail", requireAuth, readScope, async (_re
   }
 });
 
+app.get("/api/excel/export/inventory-amount", requireAuth, readScope, async (_req, res, next) => {
+  try {
+    const workbook = await buildInventoryAmountWorkbook();
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=inventory-amount.xlsx");
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/excel/export/inventory-logs", requireAuth, readScope, async (req, res, next) => {
   try {
     const workbook = await buildInventoryLogsWorkbook(req.query);
     const buffer = await workbook.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", "attachment; filename=inventory-logs.xlsx");
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/excel/export/sales-amount", requireAuth, readScope, async (req, res, next) => {
+  try {
+    const workbook = await buildSalesAmountWorkbook(req.query);
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=sales-amount.xlsx");
     res.send(Buffer.from(buffer));
   } catch (error) {
     next(error);
@@ -1601,6 +2435,8 @@ app.use((error, _req, res, _next) => {
 app.listen(port, () => {
   console.log(`Fish CMS API listening on http://127.0.0.1:${port}`);
 });
+startMonthlyInventoryAmountEmailJob();
+startDailySalesSubscriptionEmailJob();
 
 process.on("SIGINT", async () => {
   await pool.end();

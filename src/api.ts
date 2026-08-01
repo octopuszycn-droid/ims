@@ -1,5 +1,6 @@
 import type {
   Brand,
+  InventoryAbnormalLog,
   InventoryCheckDifference,
   InventoryCheckRecord,
   InventoryLog,
@@ -73,6 +74,9 @@ export const api = {
   updateUser(token: string, id: number, payload: Record<string, unknown>) {
     return request("/api/users/" + id, { method: "PUT", token, body: JSON.stringify(payload) });
   },
+  updateUserBrandSubscriptions(token: string, id: number, brandIds: number[]) {
+    return request<{ ok: boolean; subscribedBrandIds: number[] }>("/api/users/" + id + "/brand-subscriptions", { method: "PATCH", token, body: JSON.stringify({ brandIds }) });
+  },
   deleteUser(token: string, id: number) {
     return request("/api/users/" + id, { method: "DELETE", token });
   },
@@ -98,7 +102,7 @@ export const api = {
     return request<Product[]>(params.size ? `/api/products?${params.toString()}` : "/api/products", { token });
   },
   createProduct(token: string, payload: Record<string, unknown>) {
-    return request("/api/products", { method: "POST", token, body: JSON.stringify(payload) });
+    return request<{ id: number }>("/api/products", { method: "POST", token, body: JSON.stringify(payload) });
   },
   updateProduct(token: string, id: number, payload: Record<string, unknown>) {
     return request("/api/products/" + id, { method: "PUT", token, body: JSON.stringify(payload) });
@@ -117,7 +121,7 @@ export const api = {
     return request<Sku[]>(params.size ? `/api/skus?${params.toString()}` : "/api/skus", { token });
   },
   createSku(token: string, payload: Record<string, unknown>) {
-    return request("/api/skus", { method: "POST", token, body: JSON.stringify(payload) });
+    return request<{ id: number }>("/api/skus", { method: "POST", token, body: JSON.stringify(payload) });
   },
   updateSku(token: string, id: number, payload: Record<string, unknown>) {
     return request("/api/skus/" + id, { method: "PUT", token, body: JSON.stringify(payload) });
@@ -161,11 +165,27 @@ export const api = {
   outbound(token: string, payload: Record<string, unknown>) {
     return request("/api/inventory/outbound", { method: "POST", token, body: JSON.stringify(payload) });
   },
+  abnormalInventory(token: string, payload: Record<string, unknown>) {
+    return request("/api/inventory/abnormal", { method: "POST", token, body: JSON.stringify(payload) });
+  },
+  abnormalLogs(token: string, page = 1, size = 20) {
+    const params = new URLSearchParams({
+      limit: String(size),
+      offset: String((Math.max(1, page) - 1) * size),
+    });
+    return request<{ rows: InventoryAbnormalLog[]; total: number }>(`/api/inventory/abnormal-logs?${params.toString()}`, { token });
+  },
+  revokeInventoryLog(token: string, id: number) {
+    return request("/api/inventory/logs/" + id, { method: "DELETE", token });
+  },
   exportExcel(token: string) {
     return requestBlob("/api/excel/export", { token });
   },
   exportInventoryDetail(token: string) {
     return requestBlob("/api/excel/export/inventory-detail", { token });
+  },
+  exportInventoryAmount(token: string) {
+    return requestBlob("/api/excel/export/inventory-amount", { token });
   },
   exportInventoryLogs(token: string, filters: Partial<InventoryLogFilters> = {}) {
     const params = new URLSearchParams();
@@ -185,11 +205,17 @@ export const api = {
   inventoryCheckDetail(token: string, id: number) {
     return request<{ record: InventoryCheckRecord; rows: InventoryCheckDifference[] }>(`/api/inventory/checks/${id}`, { token });
   },
+  syncInventoryCheck(token: string, id: number) {
+    return request<{ record: InventoryCheckRecord; rows: InventoryCheckDifference[] }>(`/api/inventory/checks/${id}/sync`, { method: "POST", token });
+  },
   inventoryCheckTemplate(token: string) {
     return requestBlob("/api/inventory/checks/template", { token });
   },
   inventoryCheckFile(token: string, id: number) {
     return requestBlob(`/api/inventory/checks/${id}/file`, { token });
+  },
+  exportInventoryCheckDetail(token: string, id: number) {
+    return requestBlob(`/api/inventory/checks/${id}/export`, { token });
   },
   uploadInventoryCheck(token: string, file: File) {
     const formData = new FormData();
@@ -215,5 +241,9 @@ export const api = {
   salesAmount(token: string, startDate: string, endDate: string) {
     const params = new URLSearchParams({ startDate, endDate });
     return request<SalesAmountRow[]>(`/api/stats/sales/amount?${params.toString()}`, { token });
+  },
+  exportSalesAmount(token: string, startDate: string, endDate: string) {
+    const params = new URLSearchParams({ startDate, endDate });
+    return requestBlob(`/api/excel/export/sales-amount?${params.toString()}`, { token });
   },
 };

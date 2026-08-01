@@ -144,6 +144,7 @@ create table if not exists `inventory_check_differences` (
   `actual_unsalable_qty` int not null comment '实际不可售库存数',
   `salable_diff_qty` int not null comment '可售库存数差值：实际-系统',
   `unsalable_diff_qty` int not null comment '不可售库存数差值：实际-系统',
+  `purchase_price_snapshot` decimal(10,2) not null default 0.00 comment '盘点时SKU购入价格快照',
   `created_at` datetime not null default current_timestamp comment '创建时间',
   primary key (`id`),
   key `idx_inventory_check_diff_check` (`check_id`, `id`),
@@ -151,6 +152,22 @@ create table if not exists `inventory_check_differences` (
   constraint `fk_inventory_check_diff_check` foreign key (`check_id`) references `inventory_checks` (`id`) on delete cascade,
   constraint `fk_inventory_check_diff_sku` foreign key (`sku_id`) references `skus` (`id`)
 ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存盘点差异明细表';
+
+create table if not exists `inventory_abnormal_logs` (
+  `id` bigint unsigned not null auto_increment comment '异常库存记录ID',
+  `sku_id` bigint unsigned not null comment 'SKU ID',
+  `quantity` int not null comment '异常调整数量，正数增加可售库存，负数减少可售库存',
+  `reason` varchar(255) not null comment '异常原因',
+  `operator_user_id` bigint unsigned not null comment '操作人用户ID',
+  `created_at` datetime not null default current_timestamp comment '创建时间',
+  primary key (`id`),
+  key `idx_inventory_abnormal_time` (`created_at`, `id`),
+  key `idx_inventory_abnormal_sku_time` (`sku_id`, `created_at`),
+  key `idx_inventory_abnormal_operator_time` (`operator_user_id`, `created_at`),
+  constraint `fk_inventory_abnormal_sku` foreign key (`sku_id`) references `skus` (`id`),
+  constraint `fk_inventory_abnormal_operator` foreign key (`operator_user_id`) references `users` (`id`),
+  constraint `chk_inventory_abnormal_quantity` check (`quantity` <> 0)
+) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='异常库存操作记录表';
 
 insert into `permissions` (`code`, `name`, `description`) values
   (1, 'SUPER', '超级权限'),
@@ -174,3 +191,30 @@ alter table `sku_inventory` modify column `salable_qty` int not null default 0 c
 alter table `sku_inventory` modify column `unsalable_qty` int not null default 0 comment '不可售库存数';
 alter table `inventory_operation_logs` add column if not exists `platform` tinyint unsigned null comment '平台：1抖音，2拼多多，为空表示未选择' after `stock_label`;
 alter table `inventory_checks` add column if not exists `upload_file_path` varchar(255) not null default '' comment '盘点上传原始文件相对路径' after `operator_user_id`;
+alter table `inventory_check_differences` add column if not exists `purchase_price_snapshot` decimal(10,2) not null default 0.00 comment '盘点时SKU购入价格快照' after `unsalable_diff_qty`;
+alter table `inventory_checks` add column if not exists `is_synced` tinyint unsigned not null default 0 comment 'whether differences have been synced' after `upload_file_path`;
+alter table `inventory_checks` add column if not exists `synced_at` datetime null comment 'difference sync time' after `is_synced`;
+alter table `inventory_abnormal_logs` add column if not exists `stock_label` tinyint unsigned not null default 1 comment 'stock label: 1 salable, 2 unsalable' after `sku_id`;
+alter table `users` modify column `email` varchar(128) null comment 'optional notification email';
+create table if not exists `scheduled_email_jobs` (
+  `job_key` varchar(80) not null comment 'unique scheduled job key',
+  `job_type` varchar(64) not null comment 'scheduled job type',
+  `status` tinyint unsigned not null comment '1 running, 2 sent, 3 failed',
+  `run_at` datetime not null comment 'scheduled run time',
+  `sent_at` datetime null comment 'sent time',
+  `recipients` text null comment 'email recipients',
+  `message` varchar(500) not null default '' comment 'last message',
+  `created_at` datetime not null default current_timestamp comment 'created time',
+  `updated_at` datetime not null default current_timestamp on update current_timestamp comment 'updated time',
+  primary key (`job_key`),
+  key `idx_scheduled_email_jobs_type_status` (`job_type`, `status`, `run_at`)
+) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='scheduled email job log';
+create table if not exists `user_brand_subscriptions` (
+  `user_id` bigint unsigned not null comment 'subscriber user id',
+  `brand_id` bigint unsigned not null comment 'subscribed brand id',
+  `created_at` datetime not null default current_timestamp comment 'created time',
+  primary key (`user_id`, `brand_id`),
+  key `idx_user_brand_subscriptions_brand` (`brand_id`),
+  constraint `fk_user_brand_subscriptions_user` foreign key (`user_id`) references `users` (`id`) on delete cascade,
+  constraint `fk_user_brand_subscriptions_brand` foreign key (`brand_id`) references `brands` (`id`) on delete cascade
+) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='user subscribed brands';

@@ -22,6 +22,7 @@ async function runSchema() {
   await pool.query("update users set username = substring_index(email, '@', 1) where username is null or username = ''");
   await pool.query("alter table users modify column username varchar(64) not null comment '英文登录用户名'");
   await pool.query("create unique index if not exists uk_users_username on users(username)");
+  await pool.query("alter table users modify column email varchar(128) null comment 'optional notification email'");
 }
 
 const permissions = [
@@ -79,7 +80,7 @@ await withTransaction(async (connection) => {
       `insert into users(username, email, name, password_hash, status)
        values(?, ?, ?, ?, 1)
        on duplicate key update name = values(name), password_hash = values(password_hash), status = 1, deleted_at = null`,
-      [username, `${username}@fish.local`, name, passwordHash],
+      [username, null, name, passwordHash],
     );
     const [[row]] = await connection.query("select id from users where username = ?", [username]);
     await connection.execute("delete from user_permissions where user_id = ?", [row.id]);

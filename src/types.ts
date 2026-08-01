@@ -3,9 +3,11 @@ export type PermissionCode = "SUPER" | "INVENTORY" | "FINANCE";
 export type User = {
   id: number;
   username: string;
+  email: string;
   name: string;
   status: number;
   permissions: PermissionCode[];
+  subscribedBrandIds: number[];
 };
 
 export type Session = {
@@ -89,6 +91,7 @@ export type InventoryLog = {
   brandName: string;
   productName: string;
   skuName: string;
+  canRevoke: 0 | 1 | boolean;
 };
 
 export type InventoryLogFilters = {
@@ -102,11 +105,25 @@ export type InventoryLogFilters = {
   platform: "" | "douyin" | "pinduoduo";
 };
 
+export type InventoryAbnormalLog = {
+  id: number;
+  quantity: number;
+  reason: string;
+  createdAt: string;
+  operatorName: string;
+  brandName: string;
+  productName: string;
+  skuName: string;
+};
+
 export type InventoryCheckRecord = {
   id: number;
   checkTime: string;
   operatorName: string;
   uploadFilePath: string;
+  isSynced: 0 | 1 | boolean;
+  syncedAt: string | null;
+  canSync: 0 | 1 | boolean;
   differenceCount: number;
 };
 
@@ -122,7 +139,10 @@ export type InventoryCheckDifference = {
   actualSalableQty: number;
   actualUnsalableQty: number;
   salableDiffQty: number;
+  salableDiffAmount: number;
   unsalableDiffQty: number;
+  unsalableDiffAmount: number;
+  purchasePrice: number;
 };
 
 export type ProductSalesBreakdown = {
@@ -154,4 +174,9 @@ export type SalesAmountRow = {
   purchasePrice: number;
   salesQty: number;
   costAmount: number;
+  brandPlatformAmounts?: {
+    douyin: number;
+    pinduoduo: number;
+    none: number;
+  };
 };

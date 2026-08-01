@@ -1,9 +1,10 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { EChartsOption } from "echarts";
-import { Eye, EyeOff, GripVertical, Loader2, Minus, PencilLine, Plus, X } from "lucide-react";
+import { Eye, EyeOff, GripVertical, Loader2, Menu, Minus, PencilLine, Plus, X } from "lucide-react";
 import { ApiError, api } from "./api";
 import type {
   Brand,
+  InventoryAbnormalLog,
   InventoryCheckDifference,
   InventoryCheckRecord,
   InventoryLog,
@@ -63,7 +64,7 @@ type PageKey =
   | "inventory-amount"
   | "sales-amount";
 
-type DialogType = null | "user" | "brand" | "product" | "sku" | "inbound" | "outbound";
+type DialogType = null | "user" | "brand" | "product" | "sku" | "inbound" | "outbound" | "abnormal";
 type SkuFilters = { brandId: number | ""; productId: number | "" };
 type FilterBrandOption = { id: number; name: string };
 type FilterProductOption = { id: number; brandId: number; name: string };
@@ -137,6 +138,21 @@ function loadSession(): Session | null {
 
 function getServerExpiryDaysLeft() {
   return Math.max(0, Math.floor((serverExpiryAt - Date.now()) / dayMs));
+}
+
+function parseLocalDateTime(value: string) {
+  const normalized = String(value || "").replace("T", " ");
+  const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!match) return 0;
+  const [, year, month, day, hour = "0", minute = "0", second = "0"] = match;
+  return new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)).getTime();
+}
+
+function formatRevokeCountdown(milliseconds: number) {
+  const seconds = Math.max(0, Math.ceil(milliseconds / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const restSeconds = seconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(restSeconds).padStart(2, "0")}`;
 }
 
 function rowSpanFor<T>(rows: T[], index: number, getKey: (row: T) => string | number) {
@@ -218,8 +234,15 @@ export function App() {
   const [sqlPreview, setSqlPreview] = useState("");
   const [currentStock, setCurrentStock] = useState<{ salableQty: number; unsalableQty: number } | null>(null);
   const [unsalableAdjust, setUnsalableAdjust] = useState<{ row: SkuInventoryRow; quantity: number; addToSalable: boolean } | null>(null);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const serverExpiryDaysLeft = getServerExpiryDaysLeft();
   const isServerExpiryUrgent = serverExpiryDaysLeft < serverExpiryWarningDays;
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 2000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   const visibleGroups = useMemo(() => {
     if (!session) return [];
@@ -320,7 +343,7 @@ export function App() {
       setLogTotal(nextLogs.total);
       setLogFilters(nextLogFilters);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "鏁版嵁鍔犺浇澶辫触");
+      setError(nextError instanceof Error ? nextError.message : "数据加载失败");
     }
   }
 
@@ -377,7 +400,7 @@ export function App() {
     patchForm(key, value);
     if (key === "label" && value !== "unsalable") patchForm("simultaneousInbound", false);
     if (key !== "skuId") return;
-    if (dialog === "outbound" && session && Number(value)) {
+    if ((dialog === "outbound" || dialog === "abnormal") && session && Number(value)) {
       void api.skuInventoryItem(session.token, Number(value)).then((row) => {
         setCurrentStock({ salableQty: Number(row.salableQty), unsalableQty: Number(row.unsalableQty) });
       });
@@ -412,8 +435,8 @@ export function App() {
     setEditingId(user?.id ?? null);
     setForm(
       user
-        ? { username: user.username, name: user.name, password: "", confirmPassword: "", permissions: user.permissions }
-        : { username: "", name: "", password: "", confirmPassword: "", permissions: ["INVENTORY"] },
+        ? { username: user.username, email: user.email || "", name: user.name, password: "", confirmPassword: "", permissions: user.permissions }
+        : { username: "", email: "", name: "", password: "", confirmPassword: "", permissions: ["INVENTORY"] },
     );
     setDialog("user");
   }
@@ -457,12 +480,27 @@ export function App() {
       skuId: "",
       quantity: 1,
       label: "salable",
-      inboundType: "return",
+      inboundType: "new",
       simultaneousInbound: false,
-      platform: firstVisibleBrand?.defaultPlatform || "",
+      platform: type === "outbound" ? firstVisibleBrand?.defaultPlatform || "" : "",
       remark: "",
     });
     setDialog(type);
+    if (firstVisibleBrand?.id) await loadModalProducts(firstVisibleBrand.id, undefined, false);
+  }
+
+  async function openAbnormalDialog() {
+    const firstVisibleBrand = brands.find((brand) => !brand.isHidden);
+    setEditingId(null);
+    setCurrentStock(null);
+    setForm({
+      brandId: firstVisibleBrand?.id ?? "",
+      productId: "",
+      skuId: "",
+      quantity: 1,
+      reason: "",
+    });
+    setDialog("abnormal");
     if (firstVisibleBrand?.id) await loadModalProducts(firstVisibleBrand.id, undefined, false);
   }
 
@@ -471,12 +509,14 @@ export function App() {
     if (!session || !dialog) return;
     setError("");
     setNotice("");
+    let nextSkuFilters: SkuFilters | null = null;
     try {
       const token = session.token;
       if (dialog === "user") {
         if (!editingId && form.password !== form.confirmPassword) throw new Error("两次密码不一致");
         const payload = {
           username: String(form.username || "").trim(),
+          email: String(form.email || "").trim(),
           name: String(form.name || "").trim(),
           password: String(form.password || ""),
           status: 1,
@@ -497,7 +537,10 @@ export function App() {
           remark: String(form.remark || "").trim(),
         };
         if (editingId) await api.updateProduct(token, editingId, payload);
-        else await api.createProduct(token, payload);
+        else {
+          const created = await api.createProduct(token, payload);
+          nextSkuFilters = { brandId: Number(form.brandId), productId: Number(created.id) };
+        }
       }
       if (dialog === "sku") {
         const payload = {
@@ -507,7 +550,11 @@ export function App() {
           remark: String(form.remark || "").trim(),
         };
         if (editingId) await api.updateSku(token, editingId, payload);
-        else await api.createSku(token, payload);
+        else {
+          await api.createSku(token, payload);
+          const product = products.find((item) => item.id === Number(form.productId)) || modalProducts.find((item) => item.id === Number(form.productId));
+          nextSkuFilters = { brandId: product?.brandId ?? Number(form.brandId) ?? "", productId: Number(form.productId) };
+        }
       }
       if (dialog === "inbound" || dialog === "outbound") {
         if (!Number(form.productId)) throw new Error("请选择商品名");
@@ -524,9 +571,24 @@ export function App() {
         if (dialog === "inbound") await api.inbound(token, payload);
         else await api.outbound(token, payload);
       }
+      if (dialog === "abnormal") {
+        if (!Number(form.productId)) throw new Error("请选择商品名");
+        if (!Number(form.skuId)) throw new Error("请选择规格名");
+        const payload = {
+          skuId: Number(form.skuId),
+          quantity: Number(form.quantity),
+          reason: String(form.reason || "").trim(),
+        };
+        if (!payload.reason) throw new Error("请填写原因");
+        await api.abnormalInventory(token, payload);
+      }
       setDialog(null);
       setNotice("操作成功");
       await refreshData(session);
+      if (nextSkuFilters) {
+        setSkuFilters(nextSkuFilters);
+        await loadSkuList(nextSkuFilters, session);
+      }
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "操作失败");
     }
@@ -538,6 +600,13 @@ export function App() {
     await api.deleteUser(session.token, user.id);
     setNotice("操作成功");
     await refreshData(session);
+  }
+
+  async function updateUserBrandSubscriptions(user: User, brandIds: number[]) {
+    if (!session) return;
+    const result = await api.updateUserBrandSubscriptions(session.token, user.id, brandIds);
+    setUsers((current) => current.map((item) => (item.id === user.id ? { ...item, subscribedBrandIds: result.subscribedBrandIds } : item)));
+    setNotice("操作成功");
   }
 
   async function reorder(kind: "brand" | "product" | "sku", rows: Array<{ id: number }>, targetId: number) {
@@ -638,6 +707,20 @@ export function App() {
     }
   }
 
+  async function revokeInventoryLog(log: InventoryLog) {
+    if (!session) return;
+    if (!window.confirm("确定撤销这条库存操作吗？库存数量会同步恢复。")) return;
+    setError("");
+    setNotice("");
+    try {
+      await api.revokeInventoryLog(session.token, log.id);
+      setNotice("撤销成功");
+      await refreshData(session, logPage, logFilters);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "撤销失败");
+    }
+  }
+
   async function importExcel(file: File) {
     if (!session) return;
     setError("");
@@ -651,35 +734,43 @@ export function App() {
 
   if (!session) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6">
-        <form onSubmit={handleLogin} className="w-full max-w-sm rounded-lg border bg-white p-6 shadow-sm">
-          <h1 className="text-xl font-semibold text-slate-950">威海博浪峰渔具IMS</h1>
-          <div className="mt-6 space-y-3">
-            <Input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="英文用户名" disabled={isLoginLoading} />
-            <Input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="密码" type="password" disabled={isLoginLoading} />
-            {message && <p className="text-sm text-red-600">{message}</p>}
-            <Button className="w-full" type="submit" disabled={isLoginLoading}>
-              {isLoginLoading && <Loader2 className="h-4 w-4 animate-spin" />}
-              {isLoginLoading ? "登录中" : "登录"}
-            </Button>
-          </div>
-        </form>
+      <main className="flex min-h-screen flex-col bg-slate-50">
+        <div className="flex flex-1 items-center justify-center p-4 sm:p-6">
+          <form onSubmit={handleLogin} className="w-full max-w-sm rounded-lg border bg-white p-6 shadow-sm">
+            <h1 className="text-xl font-semibold text-slate-950">威海博浪峰渔具IMS</h1>
+            <div className="mt-6 space-y-3">
+              <Input value={username} onChange={(event) => setUsername(event.target.value)} placeholder="英文用户名" disabled={isLoginLoading} />
+              <Input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="密码" type="password" disabled={isLoginLoading} />
+              {message && <p className="text-sm text-red-600">{message}</p>}
+              <Button className="w-full" type="submit" disabled={isLoginLoading}>
+                {isLoginLoading && <Loader2 className="h-4 w-4 animate-spin" />}
+                {isLoginLoading ? "登录中" : "登录"}
+              </Button>
+            </div>
+          </form>
+        </div>
+        <IcpFooter />
       </main>
     );
   }
 
   return (
-    <main className="min-h-screen bg-slate-50 text-slate-900">
+    <main className="flex min-h-screen flex-col overflow-x-hidden bg-slate-50 text-slate-900">
       <header className="sticky top-0 z-20 border-b bg-white">
-        <div className="flex h-16 items-center justify-between px-6">
-          <div>
-            <h1 className="text-lg font-semibold">威海博浪峰渔具IMS</h1>
+        <div className="flex min-h-16 items-center justify-between gap-3 px-3 py-2 sm:px-4 lg:px-6">
+          <div className="flex min-w-0 items-center gap-2">
+            <Button className="md:hidden" variant="ghost" size="icon" onClick={() => setMobileNavOpen(true)} aria-label="打开导航">
+              <Menu className="h-5 w-5" />
+            </Button>
+            <div className="min-w-0">
+            <h1 className="truncate text-base font-semibold sm:text-lg">威海博浪峰渔具IMS</h1>
             <p className="text-xs text-slate-500">
               {session.user.name} · {session.permissions.map((item) => permissionLabels[item]).join("、")}
             </p>
+            </div>
           </div>
-          <div className="flex items-center gap-3">
-            <span className={["text-sm font-medium", isServerExpiryUrgent ? "text-red-600" : "text-slate-500"].join(" ")}>
+          <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+            <span className={["hidden text-sm font-medium sm:inline", isServerExpiryUrgent ? "text-red-600" : "text-slate-500"].join(" ")}>
               距离服务器到期还有 {serverExpiryDaysLeft} 天
             </span>
             {false && (
@@ -700,8 +791,53 @@ export function App() {
         </div>
       </header>
 
-      <div className="flex min-h-[calc(100vh-64px)]">
-        <aside className="w-60 shrink-0 border-r bg-white p-4">
+      {mobileNavOpen && (
+        <div className="fixed inset-0 z-40 md:hidden">
+          <button type="button" aria-label="关闭导航" className="absolute inset-0 bg-slate-950/40" onClick={() => setMobileNavOpen(false)} />
+          <aside className="absolute inset-y-0 left-0 w-72 max-w-[82vw] overflow-y-auto border-r bg-white p-4 shadow-xl">
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <h2 className="text-base font-semibold text-slate-950">导航</h2>
+                <p className="text-xs text-slate-500">{session.user.name}</p>
+              </div>
+              <Button variant="ghost" size="icon" onClick={() => setMobileNavOpen(false)} aria-label="关闭导航">
+                <X className="h-5 w-5" />
+              </Button>
+            </div>
+            <nav className="space-y-4">
+              {visibleGroups.map((group) => (
+                <div key={group.label} className="border-t border-slate-100 pt-4 first:border-t-0 first:pt-0">
+                  {group.key ? (
+                    <NavButton active={activePage === group.key} onClick={() => {
+                      changePage(group.key!);
+                      setMobileNavOpen(false);
+                    }}>
+                      {group.label}
+                    </NavButton>
+                  ) : (
+                    <>
+                      <p className="px-3 py-2 text-xs font-semibold text-slate-400">{group.label}</p>
+                      <div className="space-y-1">
+                        {group.children?.map((item) => (
+                          <NavButton key={item.key} active={activePage === item.key} onClick={() => {
+                            changePage(item.key);
+                            setMobileNavOpen(false);
+                          }}>
+                            {item.label}
+                          </NavButton>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              ))}
+            </nav>
+          </aside>
+        </div>
+      )}
+
+      <div className="flex min-h-[calc(100vh-64px)] flex-1">
+        <aside className="hidden w-60 shrink-0 border-r bg-white p-4 md:block">
           <nav className="space-y-4">
             {visibleGroups.map((group) => (
               <div key={group.label} className="border-t border-slate-100 pt-4 first:border-t-0 first:pt-0">
@@ -726,11 +862,11 @@ export function App() {
           </nav>
         </aside>
 
-        <section className="min-w-0 flex-1 space-y-4 p-6">
+        <section className="min-w-0 flex-1 space-y-4 p-3 sm:p-4 lg:p-6">
           {isLoading && <p className="rounded-lg border bg-white p-3 text-sm text-slate-500">数据加载中...</p>}
           {notice && <p className="rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-700">{notice}</p>}
           {error && <p className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-          {activePage === "users" && <UsersPage users={users} onAdd={() => void openUser()} onEdit={(user) => void openUser(user)} onDelete={deleteUser} />}
+          {activePage === "users" && <UsersPage users={users} brands={brands} onAdd={() => void openUser()} onEdit={(user) => void openUser(user)} onDelete={deleteUser} onSubscriptionChange={(user, brandIds) => void updateUserBrandSubscriptions(user, brandIds)} />}
           {activePage === "brand-list" && (
             <BrandTable brands={brands} onAdd={() => openBrand()} onEdit={openBrand} onToggleHidden={(brand) => toggleHidden("brand", brand)} onDragStart={setDragId} onDrop={(id) => reorder("brand", brands, id)} />
           )}
@@ -776,27 +912,31 @@ export function App() {
               onFilterChange={setLogFilterDraft}
               onFilterApply={(nextFilters) => void loadLogPage(1, session, nextFilters)}
               onExport={() => void exportInventoryLogs()}
+              onRevoke={(log) => void revokeInventoryLog(log)}
               onReset={() => {
                 setLogFilterDraft(emptyLogFilters);
                 void loadLogPage(1, session, emptyLogFilters);
               }}
               onInbound={() => void openStockDialog("inbound")}
               onOutbound={() => void openStockDialog("outbound")}
+              onAbnormal={() => void openAbnormalDialog()}
             />
           )}
           {activePage === "inventory-checks" && (
             <InventoryCheckPage
               token={session.token}
               canUpload={session.permissions.includes("SUPER") || session.permissions.includes("INVENTORY")}
+              onInventoryChanged={() => void refreshData(session)}
             />
           )}
           {activePage === "sales-stats" && (
             <StatsPage token={session.token} brands={brands.filter((brand) => !brand.isHidden)} />
           )}
-          {activePage === "inventory-amount" && <InventoryAmountPage rows={skuInventory} />}
+          {activePage === "inventory-amount" && <InventoryAmountPage rows={skuInventory} token={session.token} />}
           {activePage === "sales-amount" && <SalesAmountPage token={session.token} />}
         </section>
       </div>
+      <IcpFooter />
 
       {dialog && (
         <EditorDialog
@@ -817,7 +957,7 @@ export function App() {
             setCurrentStock(null);
             if (dialog === "inbound" || dialog === "outbound") {
               const selectedBrand = brands.find((brand) => brand.id === brandId);
-              patchForm("platform", selectedBrand?.defaultPlatform || "");
+              patchForm("platform", dialog === "outbound" ? selectedBrand?.defaultPlatform || "" : "");
             }
             await loadModalProducts(brandId, undefined, shouldAutoPick);
           }}
@@ -833,8 +973,8 @@ export function App() {
         />
       )}
       {unsalableAdjust && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
-          <form onSubmit={submitUnsalableAdjust} className="w-full max-w-md rounded-lg bg-white p-5 shadow-xl">
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/40 p-3 sm:items-center sm:p-4">
+          <form onSubmit={submitUnsalableAdjust} className="max-h-[calc(100vh-1.5rem)] w-full max-w-md overflow-y-auto rounded-lg bg-white p-4 shadow-xl sm:max-h-[calc(100vh-2rem)] sm:p-5">
             <div className="mb-4 flex items-center justify-between">
               <h3 className="text-lg font-semibold">修改不可售库存</h3>
               <Button variant="ghost" size="sm" onClick={() => setUnsalableAdjust(null)}>关闭</Button>
@@ -866,16 +1006,16 @@ export function App() {
               </Field>
             </div>
             <div className="mt-5 flex justify-end gap-2">
-              <Button variant="secondary" onClick={() => setUnsalableAdjust(null)}>取消</Button>
-              <Button type="submit">确定</Button>
+              <Button className="flex-1 sm:flex-none" variant="secondary" onClick={() => setUnsalableAdjust(null)}>取消</Button>
+              <Button className="flex-1 sm:flex-none" type="submit">确定</Button>
             </div>
           </form>
         </div>
       )}
       {sqlPreview && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
-          <div className="w-full max-w-4xl rounded-lg bg-white p-5 shadow-xl">
-            <div className="mb-4 flex items-center justify-between">
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/40 p-3 sm:items-center sm:p-4">
+          <div className="max-h-[calc(100vh-1.5rem)] w-full max-w-4xl overflow-y-auto rounded-lg bg-white p-4 shadow-xl sm:max-h-[calc(100vh-2rem)] sm:p-5">
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <h3 className="text-lg font-semibold">导入 SQL 预览</h3>
               <div className="flex gap-2">
                 <Button
@@ -913,6 +1053,16 @@ function NavButton({ active, onClick, children }: { active: boolean; onClick: ()
     >
       {children}
     </button>
+  );
+}
+
+function IcpFooter() {
+  return (
+    <footer className="border-t border-slate-200 bg-white px-4 py-3 text-center text-xs text-slate-500">
+      <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer" className="hover:text-blue-600 hover:underline">
+        鲁ICP备2025147752号-2
+      </a>
+    </footer>
   );
 }
 
@@ -1035,7 +1185,7 @@ function DateRangePicker2({
       <button
         type="button"
         onClick={() => setOpen((current) => !current)}
-        className="flex h-10 w-[260px] items-center justify-between rounded-lg border border-slate-200 bg-white px-3 text-left text-sm text-slate-700 shadow-sm hover:bg-slate-50"
+        className="flex h-10 w-full items-center justify-between rounded-lg border border-slate-200 bg-white px-3 text-left text-sm text-slate-700 shadow-sm hover:bg-slate-50 sm:w-[260px]"
       >
         <span className={["truncate", hasValue ? "text-slate-800" : "text-slate-400"].join(" ")}>{label}</span>
         {hasValue && (
@@ -1063,7 +1213,7 @@ function DateRangePicker2({
         )}
       </button>
       {open && (
-        <div className="absolute right-0 z-20 mt-2 w-[320px] rounded-lg border border-slate-200 bg-white p-4 shadow-lg">
+        <div className="absolute left-0 z-20 mt-2 w-[calc(100vw-2rem)] rounded-lg border border-slate-200 bg-white p-4 shadow-lg sm:left-auto sm:right-0 sm:w-[320px]">
           <div className="space-y-3">
             <label className="flex items-center gap-3 text-sm text-slate-600">
               <span className="w-16 shrink-0 text-right">开始日期</span>
@@ -1137,32 +1287,97 @@ function PaginationBar({
   );
 }
 
+function BrandSubscriptionSelector({
+  user,
+  brands,
+  layout = "mobile",
+  onChange,
+}: {
+  user: User;
+  brands: Brand[];
+  layout?: "mobile" | "desktop";
+  onChange: (brandIds: number[]) => void;
+}) {
+  if (!user.permissions.includes("SUPER") || !user.email) return <span className="text-slate-400">-</span>;
+  const selected = new Set(user.subscribedBrandIds || []);
+  const visibleBrands = brands.filter((brand) => brand.name !== "流水补录");
+  if (visibleBrands.length === 0) return <span className="text-slate-400">暂无品牌</span>;
+  return (
+    <div className={["flex flex-wrap gap-2 overflow-auto pr-1 text-xs", layout === "desktop" ? "max-h-[4.4rem]" : "max-h-28"].join(" ")}>
+      {visibleBrands.map((brand) => (
+        <label key={brand.id} className="inline-flex items-center gap-1 rounded border border-slate-200 px-2 py-1 text-slate-700">
+          <input
+            type="checkbox"
+            checked={selected.has(brand.id)}
+            onChange={(event) => {
+              const next = new Set(selected);
+              if (event.target.checked) next.add(brand.id);
+              else next.delete(brand.id);
+              onChange([...next]);
+            }}
+          />
+          {brand.name}
+        </label>
+      ))}
+    </div>
+  );
+}
+
 function UsersPage({
   users,
+  brands,
   onAdd,
   onEdit,
   onDelete,
+  onSubscriptionChange,
 }: {
   users: User[];
+  brands: Brand[];
   onAdd: () => void;
   onEdit: (user: User) => void;
   onDelete: (user: User) => void;
+  onSubscriptionChange: (user: User, brandIds: number[]) => void;
 }) {
   const pagination = usePagination(users);
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="flex items-center justify-between border-b p-5">
+      <div className="flex items-center justify-between gap-3 border-b p-4 sm:p-5">
         <h2 className="text-lg font-semibold text-slate-950">用户管理</h2>
-        <Button onClick={onAdd}>添加用户</Button>
+        <Button className="shrink-0" onClick={onAdd}>添加用户</Button>
       </div>
-      <div className="overflow-auto p-5">
-        <table className={`${tableBase} min-w-[720px]`}>
+      <div className="p-3 sm:p-5">
+        <div className="grid gap-3 md:hidden">
+          {pagination.pageRows.map((user) => (
+            <article key={user.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="mb-3 flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="font-semibold text-slate-950">{user.name}</h3>
+                  <p className="text-xs text-slate-500">{user.username}</p>
+                </div>
+                <div className="flex shrink-0 gap-3">
+                  <ActionLink onClick={() => onEdit(user)}>修改</ActionLink>
+                  <ActionLink onClick={() => onDelete(user)}>删除</ActionLink>
+                </div>
+              </div>
+              <InfoLine label="权限" value={user.permissions.map((permission) => permissionLabels[permission]).join("、")} />
+              <InfoLine label="邮箱" value={user.email || "-"} />
+              <div className="mt-2">
+                <p className="mb-1 text-xs text-slate-500">订阅品牌</p>
+                <BrandSubscriptionSelector user={user} brands={brands} onChange={(brandIds) => onSubscriptionChange(user, brandIds)} />
+              </div>
+            </article>
+          ))}
+        </div>
+        <div className="hidden overflow-auto md:block">
+        <table className={`${tableBase} min-w-[1040px]`}>
           <thead>
             <tr>
               <th className={thBase}>真实姓名</th>
               <th className={thBase}>英文用户名</th>
+              <th className={thBase}>邮箱</th>
               <th className={thBase}>权限</th>
+              <th className={thBase}>订阅品牌</th>
               <th className={userActionTh}>操作</th>
             </tr>
           </thead>
@@ -1171,7 +1386,11 @@ function UsersPage({
               <tr key={user.id}>
                 <td className={tdBase}>{user.name}</td>
                 <td className={tdBase}>{user.username}</td>
+                <td className={tdBase}>{user.email || "-"}</td>
                 <td className={tdBase}>{user.permissions.map((permission) => permissionLabels[permission]).join("、")}</td>
+                <td className={tdBase}>
+                  <BrandSubscriptionSelector user={user} brands={brands} layout="desktop" onChange={(brandIds) => onSubscriptionChange(user, brandIds)} />
+                </td>
                 <td className={userActionTd}>
                   <div className="flex whitespace-nowrap gap-3">
                     <ActionLink onClick={() => onEdit(user)}>修改</ActionLink>
@@ -1182,6 +1401,7 @@ function UsersPage({
             ))}
           </tbody>
         </table>
+        </div>
         <PaginationBar {...pagination} onPageChange={pagination.setPage} />
       </div>
     </section>
@@ -1207,11 +1427,41 @@ function BrandTable({
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="flex items-center justify-between border-b p-5">
+      <div className="flex items-center justify-between gap-3 border-b p-4 sm:p-5">
         <h2 className="text-lg font-semibold text-slate-950">品牌管理</h2>
         <Button onClick={onAdd}>新增品牌</Button>
       </div>
-      <div className="overflow-auto p-5">
+      <div className="p-3 sm:p-5">
+        <div className="grid gap-2 md:hidden">
+          {pagination.pageRows.map((brand) => (
+            <article
+              key={brand.id}
+              draggable
+              onDragStart={() => onDragStart(brand.id)}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={() => onDrop(brand.id)}
+              className={["rounded-md border border-slate-200 bg-white px-3 py-2 shadow-sm", brand.isHidden ? "text-slate-400" : ""].join(" ")}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <DragHandle />
+                    <h3 className="truncate font-semibold text-slate-950">{brand.name}</h3>
+                  </div>
+                  <p className="mt-0.5 truncate text-xs text-slate-500">
+                    默认平台：{platformLabel(brand.defaultPlatform) || "-"}{brand.remark ? ` · ${brand.remark}` : ""}
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-3">
+                  <ActionLink onClick={() => onEdit(brand)}>修改</ActionLink>
+                  <ActionLink onClick={() => onToggleHidden(brand)}>{brand.isHidden ? "取消隐藏" : "隐藏"}</ActionLink>
+                </div>
+              </div>
+              {Boolean(brand.isHidden) && <p className="mt-1 text-xs text-slate-400">已隐藏</p>}
+            </article>
+          ))}
+        </div>
+        <div className="hidden overflow-auto md:block">
         <table className={`${tableBase} min-w-[760px]`}>
           <thead>
             <tr>
@@ -1246,6 +1496,7 @@ function BrandTable({
             ))}
           </tbody>
         </table>
+        </div>
         <PaginationBar {...pagination} onPageChange={pagination.setPage} />
       </div>
     </section>
@@ -1271,11 +1522,40 @@ function ProductTable({
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="flex items-center justify-between border-b p-5">
+      <div className="flex items-center justify-between gap-3 border-b p-4 sm:p-5">
         <h2 className="text-lg font-semibold text-slate-950">商品管理</h2>
         <Button onClick={onAdd}>新增商品</Button>
       </div>
-      <div className="overflow-auto p-5">
+      <div className="p-3 sm:p-5">
+        <div className="grid gap-2 md:hidden">
+          {pagination.pageRows.map((product) => (
+            <article
+              key={product.id}
+              draggable
+              onDragStart={() => onDragStart(product.id)}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={() => onDrop(product.id)}
+              className={["rounded-md border border-slate-200 bg-white px-3 py-2 shadow-sm", product.isHidden ? "text-slate-400" : ""].join(" ")}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <DragHandle />
+                    <h3 className="truncate font-semibold text-slate-950">{product.name}</h3>
+                  </div>
+                  <p className="mt-0.5 truncate text-xs text-slate-500">
+                    {product.brandName}{product.remark ? ` · ${product.remark}` : ""}
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-3">
+                  <ActionLink onClick={() => onEdit(product)}>修改</ActionLink>
+                  <ActionLink onClick={() => onToggleHidden(product)}>{product.isHidden ? "取消隐藏" : "隐藏"}</ActionLink>
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+        <div className="hidden overflow-auto md:block">
         <table className={`${tableBase} min-w-[860px]`}>
           <thead>
             <tr>
@@ -1313,6 +1593,7 @@ function ProductTable({
             })}
           </tbody>
         </table>
+        </div>
         <PaginationBar {...pagination} onPageChange={pagination.setPage} />
       </div>
     </section>
@@ -1347,9 +1628,9 @@ function ProductFilterControls({
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-3">
+    <div className="grid w-full grid-cols-1 gap-3 sm:flex sm:w-auto sm:flex-nowrap sm:items-center">
       <Select
-        className="h-10 w-44"
+        className="h-10 w-full sm:w-44"
         value={String(filters.brandId || "")}
         onChange={(event) => applyBrandFilter(event.target.value)}
         onBlur={(event) => applyBrandFilter(event.currentTarget.value)}
@@ -1358,7 +1639,7 @@ function ProductFilterControls({
         {brands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
       </Select>
       <Select
-        className="h-10 w-44"
+        className="h-10 w-full sm:w-44"
         value={String(filters.productId || "")}
         onChange={(event) => applyProductFilter(event.target.value)}
         onBlur={(event) => applyProductFilter(event.currentTarget.value)}
@@ -1401,9 +1682,9 @@ function SkuTable({
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="flex items-center justify-between border-b p-5">
+      <div className="flex flex-col gap-4 border-b p-4 sm:p-5 lg:flex-row lg:items-center lg:justify-between">
         <h2 className="text-lg font-semibold text-slate-950">SKU 管理</h2>
-        <div className="flex flex-wrap items-center justify-end gap-3">
+        <div className="grid w-full grid-cols-1 gap-3 sm:flex sm:w-auto sm:flex-nowrap sm:items-center sm:justify-end">
           <ProductFilterControls
             brands={brandOptions}
             products={productOptions}
@@ -1411,10 +1692,40 @@ function SkuTable({
             onFilterChange={onFilterChange}
             onFilterApply={onFilterApply}
           />
-          <Button onClick={onAdd}>新增 SKU</Button>
+          <Button className="w-full sm:w-auto" onClick={onAdd}>新增 SKU</Button>
         </div>
       </div>
-      <div className="overflow-auto p-5">
+      <div className="p-3 sm:p-5">
+        <div className="grid gap-2 md:hidden">
+          {pagination.pageRows.map((sku) => (
+            <article
+              key={sku.id}
+              draggable
+              onDragStart={() => onDragStart(sku.id)}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={() => onDrop(sku.id)}
+              className={["rounded-md border border-slate-200 bg-white px-3 py-2 shadow-sm", sku.isHidden ? "text-slate-400" : ""].join(" ")}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <DragHandle />
+                    <h3 className="truncate font-semibold text-slate-950">{sku.name}</h3>
+                  </div>
+                  <p className="mt-0.5 truncate text-xs text-slate-500">
+                    {sku.brandName} · {sku.productName}{sku.remark ? ` · ${sku.remark}` : ""}
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-3">
+                  <span className="text-sm font-medium text-slate-900">¥{Number(sku.purchasePrice).toFixed(2)}</span>
+                  <ActionLink onClick={() => onEdit(sku)}>修改</ActionLink>
+                  <ActionLink onClick={() => onToggleHidden(sku)}>{sku.isHidden ? "取消隐藏" : "隐藏"}</ActionLink>
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+        <div className="hidden overflow-auto md:block">
         <table className={`${tableBase} min-w-[980px]`}>
           <thead>
             <tr>
@@ -1457,6 +1768,7 @@ function SkuTable({
             })}
           </tbody>
         </table>
+        </div>
         <PaginationBar {...pagination} onPageChange={pagination.setPage} />
       </div>
     </section>
@@ -1473,12 +1785,85 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
     }),
     { totalQty: 0, salableQty: 0, unsalableQty: 0 },
   );
+  const mobileGroups = useMemo(() => {
+    const groups = new Map<number, {
+      brandId: number;
+      brandName: string;
+      totalQty: number;
+      salableQty: number;
+      unsalableQty: number;
+      rows: ProductInventoryRow[];
+    }>();
+    for (const row of pagination.pageRows) {
+      const current = groups.get(row.brandId) || {
+        brandId: row.brandId,
+        brandName: row.brandName,
+        totalQty: 0,
+        salableQty: 0,
+        unsalableQty: 0,
+        rows: [],
+      };
+      current.totalQty += Number(row.totalQty);
+      current.salableQty += Number(row.salableQty);
+      current.unsalableQty += Number(row.unsalableQty);
+      current.rows.push(row);
+      groups.set(row.brandId, current);
+    }
+    return [...groups.values()];
+  }, [pagination.pageRows]);
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="border-b p-5"><h2 className="text-lg font-semibold text-slate-950">库存总计</h2></div>
-      <div className="space-y-3 p-5">
-        <div className="max-h-[620px] overflow-auto">
+      <div className="border-b p-4 sm:p-5"><h2 className="text-lg font-semibold text-slate-950">库存总计</h2></div>
+      <div className="space-y-3 p-3 sm:p-5">
+        <div className="grid gap-3 md:hidden">
+          {mobileGroups.map((brand) => (
+            <article key={brand.brandId} className="rounded-lg border border-slate-200 bg-white shadow-sm">
+              <div className="flex items-start justify-between gap-3 border-b bg-slate-50 px-3 py-2">
+                <div>
+                  <h3 className="font-semibold text-slate-950">{brand.brandName}</h3>
+                  <p className="text-xs text-slate-500">可售 {brand.salableQty} / 不可售 {brand.unsalableQty}</p>
+                </div>
+                <span className="shrink-0 rounded-md bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-700">总 {brand.totalQty}</span>
+              </div>
+              <div className="p-3">
+                <table className="w-full table-fixed border-collapse text-sm">
+                  <thead>
+                    <tr className="text-left text-xs text-slate-500">
+                      <th className="border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">商品名</th>
+                      <th className="w-14 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">总</th>
+                      <th className="w-14 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">可售</th>
+                      <th className="w-16 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">不可售</th>
+                      <th className="w-14 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">占比</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {brand.rows.map((row) => {
+                      const rate = total.totalQty ? Math.floor((Number(row.totalQty) / total.totalQty) * 100) : 0;
+                      return (
+                        <tr key={row.productId}>
+                          <td className="break-words border border-slate-200 px-2 py-1.5">{row.productName}</td>
+                          <td className="border border-slate-200 px-2 py-1.5">{row.totalQty}</td>
+                          <td className="border border-slate-200 px-2 py-1.5">{row.salableQty}</td>
+                          <td className="border border-slate-200 px-2 py-1.5">{row.unsalableQty}</td>
+                          <td className="border border-slate-200 px-2 py-1.5">{rate}%</td>
+                        </tr>
+                      );
+                    })}
+                    <tr className="bg-yellow-50 font-semibold">
+                      <td className="border border-slate-200 px-2 py-1.5">总计</td>
+                      <td className="border border-slate-200 px-2 py-1.5">{brand.totalQty}</td>
+                      <td className="border border-slate-200 px-2 py-1.5">{brand.salableQty}</td>
+                      <td className="border border-slate-200 px-2 py-1.5">{brand.unsalableQty}</td>
+                      <td className="border border-slate-200 px-2 py-1.5">{total.totalQty ? Math.floor((brand.totalQty / total.totalQty) * 100) : 0}%</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </article>
+          ))}
+        </div>
+        <div className="hidden max-h-[620px] overflow-auto md:block">
           <table className={`${tableBase} min-w-[920px]`}>
             <thead className="sticky top-0 z-10">
               <tr>
@@ -1531,6 +1916,15 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
           </table>
         </div>
         <PaginationBar {...pagination} onPageChange={pagination.setPage} />
+        <div className="rounded-lg border border-slate-200 bg-white p-3 md:hidden">
+          <h3 className="mb-2 font-semibold text-slate-950">全部总计</h3>
+          <div className="grid grid-cols-3 gap-2 text-center text-sm">
+            <div className="rounded-md bg-slate-50 p-2"><p className="text-xs text-slate-500">总</p><p className="font-semibold">{total.totalQty}</p></div>
+            <div className="rounded-md bg-slate-50 p-2"><p className="text-xs text-slate-500">可售</p><p className="font-semibold">{total.salableQty}</p></div>
+            <div className="rounded-md bg-slate-50 p-2"><p className="text-xs text-slate-500">不可售</p><p className="font-semibold">{total.unsalableQty}</p></div>
+          </div>
+        </div>
+        <div className="hidden overflow-auto md:block">
         <table className={`${tableBase} min-w-[920px]`}>
           <thead>
             <tr>
@@ -1551,6 +1945,7 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
             </tr>
           </tbody>
         </table>
+        </div>
       </div>
     </section>
   );
@@ -1589,12 +1984,73 @@ function SkuInventoryPage({
     [rows, filters],
   );
   const pagination = usePagination(filteredRows);
+  const mobileGroups = useMemo(() => {
+    const brandMap = new Map<number, {
+      brandId: number;
+      brandName: string;
+      totalQty: number;
+      salableQty: number;
+      unsalableQty: number;
+      products: Map<number, {
+        productId: number;
+        productName: string;
+        totalQty: number;
+        salableQty: number;
+        unsalableQty: number;
+        rows: SkuInventoryRow[];
+      }>;
+    }>();
+
+    for (const row of pagination.pageRows) {
+      let brand = brandMap.get(row.brandId);
+      if (!brand) {
+        brand = {
+          brandId: row.brandId,
+          brandName: row.brandName,
+          totalQty: 0,
+          salableQty: 0,
+          unsalableQty: 0,
+          products: new Map(),
+        };
+        brandMap.set(row.brandId, brand);
+      }
+
+      let product = brand.products.get(row.productId);
+      if (!product) {
+        product = {
+          productId: row.productId,
+          productName: row.productName,
+          totalQty: 0,
+          salableQty: 0,
+          unsalableQty: 0,
+          rows: [],
+        };
+        brand.products.set(row.productId, product);
+      }
+
+      const salableQty = Number(row.salableQty);
+      const unsalableQty = Number(row.unsalableQty);
+      const totalQty = salableQty + unsalableQty;
+      brand.totalQty += totalQty;
+      brand.salableQty += salableQty;
+      brand.unsalableQty += unsalableQty;
+      product.totalQty += totalQty;
+      product.salableQty += salableQty;
+      product.unsalableQty += unsalableQty;
+      product.rows.push(row);
+    }
+
+    return [...brandMap.values()].map((brand) => ({
+      ...brand,
+      products: [...brand.products.values()],
+    }));
+  }, [pagination.pageRows]);
 
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="flex flex-wrap items-center justify-between gap-4 border-b p-5">
+      <div className="flex flex-col gap-4 border-b p-4 sm:p-5 lg:flex-row lg:items-center lg:justify-between">
         <h2 className="text-lg font-semibold text-slate-950">库存明细</h2>
-        <div className="flex flex-wrap items-center justify-end gap-3">
+        <div className="grid w-full grid-cols-1 gap-3 sm:flex sm:w-auto sm:flex-nowrap sm:items-center sm:justify-end">
           <ProductFilterControls
             brands={brandOptions}
             products={productOptions}
@@ -1602,52 +2058,114 @@ function SkuInventoryPage({
             onFilterChange={onFilterChange}
             onFilterApply={onFilterApply}
           />
-          <Button onClick={onExport}>导出</Button>
+          <Button className="w-full sm:w-auto" onClick={onExport}>导出</Button>
         </div>
       </div>
-      <div className="overflow-auto p-5">
-        <table className={`${tableBase} min-w-[900px]`}>
-          <thead>
-            <tr>
-              <th className={thBase}>品牌名</th>
-              <th className={thBase}>商品名</th>
-              <th className={thBase}>规格名</th>
-              <th className={thBase}>库存总量</th>
-              <th className={thBase}>可售库存数</th>
-              <th className={thBase}>不可售库存数</th>
-            </tr>
-          </thead>
-          <tbody>
-            {pagination.pageRows.map((row, index) => {
-              const brandSpan = rowSpanFor(pagination.pageRows, index, (item) => item.brandId);
-              const productSpan = rowSpanFor(pagination.pageRows, index, (item) => `${item.brandId}-${item.productId}`);
-              const salable = Number(row.salableQty);
-              return (
-                <tr key={row.skuId}>
-                  {brandSpan > 0 && <td className={`${tdBase} text-center font-medium`} rowSpan={brandSpan}>{row.brandName}</td>}
-                  {productSpan > 0 && <td className={`${tdBase} text-center`} rowSpan={productSpan}>{row.productName}</td>}
-                  <td className={tdBase}>{row.skuName}</td>
-                  <td className={tdBase}>{salable + Number(row.unsalableQty)}</td>
-                  <td className={[tdBase, salable === 0 ? "bg-red-100 font-semibold text-red-700" : salable === 1 ? "bg-amber-100 font-semibold text-amber-700" : ""].join(" ")}>{salable}</td>
-                  <td className={tdBase}>
-                    <span className="inline-flex items-center gap-2">
-                      {row.unsalableQty}
-                      {canWrite && Number(row.unsalableQty) > 0 && (
-                        <button
-                          type="button"
-                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-50"
-                          onClick={() => onAdjust(row)}
-                        >
-                          <PencilLine className="h-4 w-4" />
-                        </button>
-                      )}
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <div className="p-3 sm:p-5">
+        <div className="grid gap-3 md:hidden">
+          {mobileGroups.map((brand) => (
+            <div key={brand.brandId} className="rounded-lg border border-slate-200 bg-white shadow-sm">
+              <div className="flex items-center justify-between gap-3 border-b bg-slate-50 px-3 py-2">
+                <div>
+                  <h3 className="font-semibold text-slate-950">{brand.brandName}</h3>
+                  <p className="text-xs text-slate-500">可售 {brand.salableQty} / 不可售 {brand.unsalableQty}</p>
+                </div>
+                <span className="rounded-md bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-700">总 {brand.totalQty}</span>
+              </div>
+              <div className="divide-y divide-slate-100">
+                {brand.products.map((product) => (
+                  <div key={product.productId} className="p-3">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <h4 className="font-semibold text-slate-900">{product.productName}</h4>
+                      <span className="rounded bg-slate-100 px-2 py-1 text-xs font-semibold text-slate-600">总 {product.totalQty}</span>
+                    </div>
+                    <table className="w-full table-fixed border-collapse text-sm">
+                      <thead>
+                        <tr className="text-left text-xs text-slate-500">
+                          <th className="border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">规格名</th>
+                          <th className="w-16 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">可售</th>
+                          <th className="w-20 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">不可售</th>
+                          <th className="w-14 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">总</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {product.rows.map((row) => {
+                          const salable = Number(row.salableQty);
+                          const unsalable = Number(row.unsalableQty);
+                          return (
+                            <tr key={row.skuId}>
+                              <td className="break-words border border-slate-200 px-2 py-1.5">{row.skuName}</td>
+                              <td className={["border border-slate-200 px-2 py-1.5", salable === 0 ? "bg-red-50 font-semibold text-red-700" : salable === 1 ? "bg-amber-50 font-semibold text-amber-700" : ""].join(" ")}>{salable}</td>
+                              <td className="border border-slate-200 px-2 py-1.5">
+                                <span className="inline-flex items-center gap-1">
+                                  {unsalable}
+                                  {canWrite && unsalable > 0 && (
+                                    <button
+                                      type="button"
+                                      className="inline-flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-50"
+                                      onClick={() => onAdjust(row)}
+                                    >
+                                      <PencilLine className="h-3.5 w-3.5" />
+                                    </button>
+                                  )}
+                                </span>
+                              </td>
+                              <td className="border border-slate-200 px-2 py-1.5">{salable + unsalable}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="hidden overflow-auto md:block">
+          <table className={`${tableBase} min-w-[900px]`}>
+            <thead>
+              <tr>
+                <th className={thBase}>品牌名</th>
+                <th className={thBase}>商品名</th>
+                <th className={thBase}>规格名</th>
+                <th className={thBase}>库存总量</th>
+                <th className={thBase}>可售库存数</th>
+                <th className={thBase}>不可售库存数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pagination.pageRows.map((row, index) => {
+                const brandSpan = rowSpanFor(pagination.pageRows, index, (item) => item.brandId);
+                const productSpan = rowSpanFor(pagination.pageRows, index, (item) => `${item.brandId}-${item.productId}`);
+                const salable = Number(row.salableQty);
+                return (
+                  <tr key={row.skuId}>
+                    {brandSpan > 0 && <td className={`${tdBase} text-center font-medium`} rowSpan={brandSpan}>{row.brandName}</td>}
+                    {productSpan > 0 && <td className={`${tdBase} text-center`} rowSpan={productSpan}>{row.productName}</td>}
+                    <td className={tdBase}>{row.skuName}</td>
+                    <td className={tdBase}>{salable + Number(row.unsalableQty)}</td>
+                    <td className={[tdBase, salable === 0 ? "bg-red-100 font-semibold text-red-700" : salable === 1 ? "bg-amber-100 font-semibold text-amber-700" : ""].join(" ")}>{salable}</td>
+                    <td className={tdBase}>
+                      <span className="inline-flex items-center gap-2">
+                        {row.unsalableQty}
+                        {canWrite && Number(row.unsalableQty) > 0 && (
+                          <button
+                            type="button"
+                            className="inline-flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-50"
+                            onClick={() => onAdjust(row)}
+                          >
+                            <PencilLine className="h-4 w-4" />
+                          </button>
+                        )}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
         <PaginationBar {...pagination} onPageChange={pagination.setPage} />
       </div>
     </section>
@@ -1665,9 +2183,11 @@ function LogTable({
   onFilterChange,
   onFilterApply,
   onExport,
+  onRevoke,
   onReset,
   onInbound,
   onOutbound,
+  onAbnormal,
 }: {
   logs: InventoryLog[];
   page: number;
@@ -1679,10 +2199,13 @@ function LogTable({
   onFilterChange: (filters: InventoryLogFilters) => void;
   onFilterApply: (filters: InventoryLogFilters) => void;
   onExport: () => void;
+  onRevoke: (log: InventoryLog) => void;
   onReset: () => void;
   onInbound: () => void;
   onOutbound: () => void;
+  onAbnormal: () => void;
 }) {
+  const [now, setNow] = useState(() => Date.now());
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const start = total ? (page - 1) * pageSize + 1 : 0;
   const end = Math.min(total, (page - 1) * pageSize + logs.length);
@@ -1700,32 +2223,45 @@ function LogTable({
     return [...map.values()];
   }, [catalogRows, filters.brandId]);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   function patchFilters(patch: Partial<InventoryLogFilters>) {
     const nextFilters = { ...filters, ...patch };
     onFilterChange(nextFilters);
     onFilterApply(nextFilters);
   }
 
+  function renderRevokeAction(log: InventoryLog) {
+    const createdAt = parseLocalDateTime(String(log.createdAt));
+    const remaining = 10 * 60 * 1000 - (now - createdAt);
+    if (!canWrite || !log.canRevoke || !createdAt || remaining <= 0) return <span className="text-slate-400">-</span>;
+    return <ActionLink onClick={() => onRevoke(log)}>撤销({formatRevokeCountdown(remaining)})</ActionLink>;
+  }
+
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="flex items-center justify-between border-b p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b p-4 sm:p-5">
         <h2 className="text-lg font-semibold text-slate-950">库存操作</h2>
         {canWrite && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Button onClick={onOutbound}>出库</Button>
             <Button onClick={onInbound}>入库</Button>
+            <Button className="bg-yellow-400 text-yellow-950 hover:bg-yellow-500 focus-visible:ring-yellow-500" onClick={onAbnormal}>异常库存</Button>
           </div>
         )}
       </div>
-      <div className="border-b bg-slate-50/60 p-5">
-        <div className="flex flex-wrap items-center gap-3">
+      <div className="border-b bg-slate-50/60 p-3 sm:p-5">
+        <div className="grid grid-cols-1 gap-3 sm:flex sm:flex-wrap sm:items-center">
           <DateRangePicker2
             filters={filters}
             onChange={(next) => patchFilters({ startAt: next.startAt, endAt: next.endAt })}
             onClear={onReset}
           />
           <Select
-            className={["h-10 w-28", filters.operationType ? "" : "text-slate-400"].join(" ")}
+            className={["h-10 w-full sm:w-28", filters.operationType ? "" : "text-slate-400"].join(" ")}
             value={filters.operationType}
             onChange={(event) => patchFilters({ operationType: event.target.value as InventoryLogFilters["operationType"] })}
           >
@@ -1734,7 +2270,7 @@ function LogTable({
             <option className="text-slate-800" value="2">出库</option>
           </Select>
           <Select
-            className={["h-10 w-36", filters.brandId ? "" : "text-slate-400"].join(" ")}
+            className={["h-10 w-full sm:w-36", filters.brandId ? "" : "text-slate-400"].join(" ")}
             value={String(filters.brandId || "")}
             onChange={(event) => patchFilters({ brandId: event.target.value ? Number(event.target.value) : "", productId: "" })}
           >
@@ -1742,7 +2278,7 @@ function LogTable({
             {brandOptions.map((brand) => <option className="text-slate-800" key={brand.id} value={brand.id}>{brand.name}</option>)}
           </Select>
           <Select
-            className={["h-10 w-36", filters.productId ? "" : "text-slate-400"].join(" ")}
+            className={["h-10 w-full sm:w-36", filters.productId ? "" : "text-slate-400"].join(" ")}
             value={String(filters.productId || "")}
             onChange={(event) => patchFilters({ productId: event.target.value ? Number(event.target.value) : "" })}
           >
@@ -1750,7 +2286,7 @@ function LogTable({
             {productOptions.map((product) => <option className="text-slate-800" key={product.id} value={product.id}>{product.name}</option>)}
           </Select>
           <Select
-            className={["h-10 w-28", filters.inboundType ? "" : "text-slate-400"].join(" ")}
+            className={["h-10 w-full sm:w-28", filters.inboundType ? "" : "text-slate-400"].join(" ")}
             value={filters.inboundType}
             onChange={(event) => patchFilters({ inboundType: event.target.value as InventoryLogFilters["inboundType"] })}
           >
@@ -1759,7 +2295,7 @@ function LogTable({
             <option className="text-slate-800" value="2">退货</option>
           </Select>
           <Select
-            className={["h-10 w-28", filters.stockLabel ? "" : "text-slate-400"].join(" ")}
+            className={["h-10 w-full sm:w-28", filters.stockLabel ? "" : "text-slate-400"].join(" ")}
             value={filters.stockLabel}
             onChange={(event) => patchFilters({ stockLabel: event.target.value as InventoryLogFilters["stockLabel"] })}
           >
@@ -1768,7 +2304,7 @@ function LogTable({
             <option className="text-slate-800" value="2">不可售</option>
           </Select>
           <Select
-            className={["h-10 w-28", filters.platform ? "" : "text-slate-400"].join(" ")}
+            className={["h-10 w-full sm:w-28", filters.platform ? "" : "text-slate-400"].join(" ")}
             value={filters.platform}
             onChange={(event) => patchFilters({ platform: event.target.value as InventoryLogFilters["platform"] })}
           >
@@ -1776,10 +2312,36 @@ function LogTable({
             <option className="text-slate-800" value="douyin">抖音</option>
             <option className="text-slate-800" value="pinduoduo">拼多多</option>
           </Select>
-          <Button onClick={onExport}>导出</Button>
+          <Button className="w-full sm:w-auto" onClick={onExport}>导出</Button>
         </div>
       </div>
-      <div className="overflow-auto p-5">
+      <div className="p-3 sm:p-5">
+        <div className="grid gap-3 md:hidden">
+          {logs.map((log) => (
+            <article key={log.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+              <div className="mb-3 flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs text-slate-500">{String(log.createdAt).replace("T", " ").slice(0, 19)}</p>
+                  <h3 className="mt-1 font-semibold text-slate-950">{log.brandName} · {log.productName}</h3>
+                  <p className="text-sm text-slate-600">{log.skuName}</p>
+                </div>
+                <div className="flex shrink-0 flex-col items-end gap-2">
+                  <OperationTypeBadge value={log.operationType} />
+                  {renderRevokeAction(log)}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                <InfoLine label="数量" value={log.quantity} />
+                <InfoLine label="平台" value={platformLabel(log.platform) || "-"} />
+                <InfoLine label="标签" value={<StockLabelText value={log.stockLabel} />} />
+                <InfoLine label="入库类型" value={log.operationType === 1 ? <InboundTypeText value={log.inboundType} /> : "-"} />
+                <InfoLine label="操作人" value={log.operatorName} />
+                <InfoLine label="备注" value={log.remark || "-"} />
+              </div>
+            </article>
+          ))}
+        </div>
+        <div className="hidden overflow-auto md:block">
         <table className={`${tableBase} min-w-[980px]`}>
           <thead>
             <tr>
@@ -1794,6 +2356,7 @@ function LogTable({
               <th className={thBase}>数量</th>
               <th className={thBase}>操作人</th>
               <th className={thBase}>备注</th>
+              <th className={actionTh}>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -1810,27 +2373,37 @@ function LogTable({
                 <td className={tdBase}>{log.quantity}</td>
                 <td className={tdBase}>{log.operatorName}</td>
                 <td className={tdBase}>{log.remark || "-"}</td>
+                <td className={actionTd}>{renderRevokeAction(log)}</td>
               </tr>
             ))}
           </tbody>
         </table>
+        </div>
         <PaginationBar page={page} totalPages={totalPages} start={start} end={end} total={total} onPageChange={onPageChange} />
       </div>
     </section>
   );
 }
 
-function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: boolean }) {
+function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: string; canUpload: boolean; onInventoryChanged: () => void }) {
   const [records, setRecords] = useState<InventoryCheckRecord[]>([]);
+  const [abnormalLogs, setAbnormalLogs] = useState<InventoryAbnormalLog[]>([]);
+  const [abnormalTotal, setAbnormalTotal] = useState(0);
+  const [abnormalPage, setAbnormalPage] = useState(1);
   const [selectedRecord, setSelectedRecord] = useState<InventoryCheckRecord | null>(null);
   const [detailRows, setDetailRows] = useState<InventoryCheckDifference[]>([]);
   const [loading, setLoading] = useState(false);
   const [isUploadProcessing, setIsUploadProcessing] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const recordPagination = usePagination(records);
+  const recordPagination = usePagination(records, 5);
   const detailPagination = usePagination(detailRows);
+  const abnormalPageSize = 20;
+  const abnormalStart = abnormalTotal ? (abnormalPage - 1) * abnormalPageSize + 1 : 0;
+  const abnormalEnd = Math.min(abnormalTotal, (abnormalPage - 1) * abnormalPageSize + abnormalLogs.length);
+  const abnormalTotalPages = Math.max(1, Math.ceil(abnormalTotal / abnormalPageSize));
 
   async function loadRecords() {
     setLoading(true);
@@ -1844,8 +2417,21 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
     }
   }
 
+  async function loadAbnormalLogs(nextPage = abnormalPage) {
+    setError("");
+    try {
+      const result = await api.abnormalLogs(token, nextPage, abnormalPageSize);
+      setAbnormalLogs(result.rows);
+      setAbnormalTotal(result.total);
+      setAbnormalPage(nextPage);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "异常库存记录加载失败");
+    }
+  }
+
   useEffect(() => {
     void loadRecords();
+    void loadAbnormalLogs(1);
   }, [token]);
 
   async function openDetail(id: number) {
@@ -1898,6 +2484,43 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
     }
   }
 
+  async function exportCheckDetail(record: InventoryCheckRecord) {
+    setError("");
+    try {
+      const blob = await api.exportInventoryCheckDetail(token, record.id);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `盘点详情-${record.checkTime.replace(/[^\d]/g, "").slice(0, 14)}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "盘点详情导出失败");
+    }
+  }
+
+  async function syncCheckDifferences(record: InventoryCheckRecord) {
+    if (!window.confirm("确定将本次盘点差异同步到真实库存吗？")) return;
+    setIsSyncing(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await api.syncInventoryCheck(token, record.id);
+      setSelectedRecord(result.record);
+      setDetailRows(result.rows);
+      setMessage("库存盘点差异已同步");
+      await loadRecords();
+      await loadAbnormalLogs(1);
+      onInventoryChanged();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "库存盘点差异同步失败");
+    } finally {
+      setIsSyncing(false);
+    }
+  }
+
   async function uploadCheck(file: File) {
     setLoading(true);
     setIsUploadProcessing(true);
@@ -1939,14 +2562,69 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
                 {selectedRecord.checkTime} · {selectedRecord.operatorName} · 差异 {selectedRecord.differenceCount} 条
               </p>
             </div>
-            <Button variant="secondary" onClick={() => {
-              setSelectedRecord(null);
-              setDetailRows([]);
-            }}>返回列表</Button>
+            <div className="flex flex-wrap gap-2">
+              {canUpload && Boolean(selectedRecord.canSync) && detailRows.length > 0 && (
+                <Button
+                  className="bg-yellow-400 text-yellow-950 hover:bg-yellow-500 focus-visible:ring-yellow-500"
+                  onClick={() => void syncCheckDifferences(selectedRecord)}
+                  disabled={isSyncing}
+                >
+                  {isSyncing ? "同步中" : "同步差异库存"}
+                </Button>
+              )}
+              <Button onClick={() => void exportCheckDetail(selectedRecord)}>导出</Button>
+              <Button variant="secondary" onClick={() => {
+                setSelectedRecord(null);
+                setDetailRows([]);
+              }}>返回列表</Button>
+            </div>
           </div>
+          {message && <p className="m-5 rounded-md border border-green-200 bg-green-50 p-3 text-sm text-green-700">{message}</p>}
           {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-          <div className="overflow-auto p-5">
-            <table className={`${tableBase} min-w-[1180px]`}>
+          <div className="p-3 sm:p-5">
+            <div className="grid gap-3 md:hidden">
+              {detailPagination.pageRows.map((row) => (
+                <article key={row.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+                  <div className="mb-3">
+                    <h3 className="font-semibold text-slate-950">{row.brandName} · {row.productName}</h3>
+                    <p className="text-sm text-slate-500">{row.skuName}</p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-center text-sm">
+                    <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                      <p className="text-xs text-slate-500">系统可售</p>
+                      <p className="font-semibold">{row.systemSalableQty}</p>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                      <p className="text-xs text-slate-500">实际可售</p>
+                      <p className="font-semibold">{row.actualSalableQty}</p>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                      <p className="text-xs text-slate-500">系统不可售</p>
+                      <p className="font-semibold">{row.systemUnsalableQty}</p>
+                    </div>
+                    <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                      <p className="text-xs text-slate-500">实际不可售</p>
+                      <p className="font-semibold">{row.actualUnsalableQty}</p>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                    <div className="rounded-md border border-slate-200 p-2">
+                      <p className="text-xs text-slate-500">可售差值</p>
+                      <p className={diffClass(row.salableDiffQty)}>{formatSigned(row.salableDiffQty)}</p>
+                      <p className={["text-xs", diffClass(row.salableDiffQty)].join(" ")}>{formatMoney(row.salableDiffAmount)}</p>
+                    </div>
+                    <div className="rounded-md border border-slate-200 p-2">
+                      <p className="text-xs text-slate-500">不可售差值</p>
+                      <p className={diffClass(row.unsalableDiffQty)}>{formatSigned(row.unsalableDiffQty)}</p>
+                      <p className={["text-xs", diffClass(row.unsalableDiffQty)].join(" ")}>{formatMoney(row.unsalableDiffAmount)}</p>
+                    </div>
+                  </div>
+                </article>
+              ))}
+              {!detailRows.length && <p className="rounded-lg border border-slate-200 p-4 text-center text-sm text-slate-500">本次盘点没有差异</p>}
+            </div>
+            <div className="hidden overflow-auto md:block">
+            <table className={`${tableBase} min-w-[1380px]`}>
               <thead>
                 <tr>
                   <th className={thBase}>品牌名</th>
@@ -1957,7 +2635,9 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
                   <th className={thBase}>实际可售库存数</th>
                   <th className={thBase}>实际不可售库存数</th>
                   <th className={thBase}>可售库存数差值</th>
+                  <th className={thBase}>可售差值金额</th>
                   <th className={thBase}>不可售库存数差值</th>
+                  <th className={thBase}>不可售差值金额</th>
                 </tr>
               </thead>
               <tbody>
@@ -1974,17 +2654,20 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
                       <td className={tdBase}>{row.actualSalableQty}</td>
                       <td className={tdBase}>{row.actualUnsalableQty}</td>
                       <td className={[tdBase, diffClass(row.salableDiffQty)].join(" ")}>{formatSigned(row.salableDiffQty)}</td>
+                      <td className={[tdBase, diffClass(row.salableDiffQty)].join(" ")}>{formatMoney(row.salableDiffAmount)}</td>
                       <td className={[tdBase, diffClass(row.unsalableDiffQty)].join(" ")}>{formatSigned(row.unsalableDiffQty)}</td>
+                      <td className={[tdBase, diffClass(row.unsalableDiffQty)].join(" ")}>{formatMoney(row.unsalableDiffAmount)}</td>
                     </tr>
                   );
                 })}
                 {!detailRows.length && (
                   <tr>
-                    <td className={`${tdBase} text-center text-slate-500`} colSpan={9}>本次盘点没有差异</td>
+                    <td className={`${tdBase} text-center text-slate-500`} colSpan={11}>本次盘点没有差异</td>
                   </tr>
                 )}
               </tbody>
             </table>
+            </div>
             <PaginationBar {...detailPagination} onPageChange={detailPagination.setPage} />
           </div>
         </section>
@@ -1993,64 +2676,156 @@ function InventoryCheckPage({ token, canUpload }: { token: string; canUpload: bo
   }
 
   return (
-    <section className="rounded-lg border bg-white shadow-sm">
+    <>
       {uploadProcessingOverlay}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
-        <h2 className="text-lg font-semibold text-slate-950">库存盘点</h2>
-        <div className="flex items-center gap-2">
-          <Button variant="secondary" onClick={() => void downloadTemplate()}>下载模板</Button>
-          {canUpload && (
-            <>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".xlsx,.xls"
-                className="hidden"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) void uploadCheck(file);
-                }}
-              />
-              <Button onClick={() => fileInputRef.current?.click()} disabled={loading}>上传数据</Button>
-            </>
-          )}
-        </div>
-      </div>
-      {message && <p className="m-5 rounded-md border border-green-200 bg-green-50 p-3 text-sm text-green-700">{message}</p>}
-      {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-      <div className="overflow-auto p-5">
-        <table className={`${tableBase} min-w-[760px]`}>
-          <thead>
-            <tr>
-              <th className={thBase}>盘点时间</th>
-              <th className={thBase}>差异数量</th>
-              <th className={thBase}>操作人</th>
-              <th className={actionTh}>查看详情</th>
-              <th className={actionTh}>下载盘点数据</th>
-            </tr>
-          </thead>
-          <tbody>
-            {recordPagination.pageRows.map((record) => (
-              <tr key={record.id}>
-                <td className={tdBase}>{record.checkTime}</td>
-                <td className={tdBase}>{record.differenceCount}</td>
-                <td className={tdBase}>{record.operatorName}</td>
-                <td className={actionTd}><ActionLink onClick={() => void openDetail(record.id)}>查看详情</ActionLink></td>
-                <td className={actionTd}>
-                  {record.uploadFilePath ? <ActionLink onClick={() => void downloadCheckFile(record)}>下载</ActionLink> : <span className="text-slate-400">-</span>}
-                </td>
-              </tr>
-            ))}
-            {!records.length && (
-              <tr>
-                <td className={`${tdBase} text-center text-slate-500`} colSpan={5}>暂无盘点记录</td>
-              </tr>
+      <section className="rounded-lg border bg-white shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
+          <h2 className="text-lg font-semibold text-slate-950">库存盘点</h2>
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" onClick={() => void downloadTemplate()}>下载模板</Button>
+            {canUpload && (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".xlsx,.xls"
+                  className="hidden"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) void uploadCheck(file);
+                  }}
+                />
+                <Button onClick={() => fileInputRef.current?.click()} disabled={loading}>上传数据</Button>
+              </>
             )}
-          </tbody>
-        </table>
-        <PaginationBar {...recordPagination} onPageChange={recordPagination.setPage} />
-      </div>
-    </section>
+          </div>
+        </div>
+        {message && <p className="m-5 rounded-md border border-green-200 bg-green-50 p-3 text-sm text-green-700">{message}</p>}
+        {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+        <div className="p-3 sm:p-5">
+          <div className="grid gap-3 md:hidden">
+            {recordPagination.pageRows.map((record) => (
+              <article key={record.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+                <div className="mb-3 flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="font-semibold text-slate-950">{record.checkTime}</h3>
+                    <p className="text-sm text-slate-500">{record.operatorName}</p>
+                  </div>
+                  <span className="rounded-md bg-blue-50 px-2 py-1 text-sm font-semibold text-blue-700">差异 {record.differenceCount}</span>
+                </div>
+                <div className="flex justify-end gap-3">
+                  <ActionLink onClick={() => void openDetail(record.id)}>查看详情</ActionLink>
+                  {record.uploadFilePath ? <ActionLink onClick={() => void downloadCheckFile(record)}>下载</ActionLink> : <span className="text-sm text-slate-400">-</span>}
+                </div>
+              </article>
+            ))}
+            {!records.length && <p className="rounded-lg border border-slate-200 p-4 text-center text-sm text-slate-500">暂无盘点记录</p>}
+          </div>
+          <div className="hidden overflow-auto md:block">
+          <table className={`${tableBase} min-w-[760px]`}>
+            <thead>
+              <tr>
+                <th className={thBase}>盘点时间</th>
+                <th className={thBase}>差异数量</th>
+                <th className={thBase}>操作人</th>
+                <th className={actionTh}>查看详情</th>
+                <th className={actionTh}>下载盘点数据</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recordPagination.pageRows.map((record) => (
+                <tr key={record.id}>
+                  <td className={tdBase}>{record.checkTime}</td>
+                  <td className={tdBase}>{record.differenceCount}</td>
+                  <td className={tdBase}>{record.operatorName}</td>
+                  <td className={actionTd}><ActionLink onClick={() => void openDetail(record.id)}>查看详情</ActionLink></td>
+                  <td className={actionTd}>
+                    {record.uploadFilePath ? <ActionLink onClick={() => void downloadCheckFile(record)}>下载</ActionLink> : <span className="text-slate-400">-</span>}
+                  </td>
+                </tr>
+              ))}
+              {!records.length && (
+                <tr>
+                  <td className={`${tdBase} text-center text-slate-500`} colSpan={5}>暂无盘点记录</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          </div>
+          <PaginationBar {...recordPagination} onPageChange={recordPagination.setPage} />
+        </div>
+      </section>
+
+      <section className="rounded-lg border bg-white shadow-sm">
+        <div className="border-b p-5">
+          <h2 className="text-lg font-semibold text-slate-950">异常库存记录</h2>
+        </div>
+        <div className="p-3 sm:p-5">
+          <div className="grid gap-3 md:hidden">
+            {abnormalLogs.map((log) => (
+              <article key={log.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+                <div className="mb-3 flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs text-slate-500">{log.createdAt}</p>
+                    <h3 className="mt-1 font-semibold text-slate-950">{log.brandName} · {log.productName}</h3>
+                    <p className="text-sm text-slate-600">{log.skuName}</p>
+                  </div>
+                  <span className={["shrink-0 rounded-md px-2 py-1 text-sm font-semibold", Number(log.quantity) > 0 ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700"].join(" ")}>
+                    {formatSigned(log.quantity)}
+                  </span>
+                </div>
+                <div className="space-y-2">
+                  <InfoLine label="原因" value={log.reason} />
+                  <InfoLine label="操作人" value={log.operatorName} />
+                </div>
+              </article>
+            ))}
+            {!abnormalLogs.length && <p className="rounded-lg border border-slate-200 p-4 text-center text-sm text-slate-500">暂无异常库存记录</p>}
+          </div>
+          <div className="hidden overflow-auto md:block">
+            <table className={`${tableBase} min-w-[920px]`}>
+              <thead>
+                <tr>
+                  <th className={thBase}>时间</th>
+                  <th className={thBase}>品牌名</th>
+                  <th className={thBase}>商品名</th>
+                  <th className={thBase}>规格名</th>
+                  <th className={thBase}>数量</th>
+                  <th className={thBase}>原因</th>
+                  <th className={thBase}>操作人</th>
+                </tr>
+              </thead>
+              <tbody>
+                {abnormalLogs.map((log) => (
+                  <tr key={log.id}>
+                    <td className={tdBase}>{log.createdAt}</td>
+                    <td className={tdBase}>{log.brandName}</td>
+                    <td className={tdBase}>{log.productName}</td>
+                    <td className={tdBase}>{log.skuName}</td>
+                    <td className={[tdBase, Number(log.quantity) > 0 ? "font-semibold text-green-700" : "font-semibold text-red-700"].join(" ")}>{formatSigned(log.quantity)}</td>
+                    <td className={tdBase}>{log.reason}</td>
+                    <td className={tdBase}>{log.operatorName}</td>
+                  </tr>
+                ))}
+                {!abnormalLogs.length && (
+                  <tr>
+                    <td className={`${tdBase} text-center text-slate-500`} colSpan={7}>暂无异常库存记录</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <PaginationBar
+            page={abnormalPage}
+            totalPages={abnormalTotalPages}
+            start={abnormalStart}
+            end={abnormalEnd}
+            total={abnormalTotal}
+            onPageChange={(nextPage) => void loadAbnormalLogs(nextPage)}
+          />
+        </div>
+      </section>
+    </>
   );
 }
 
@@ -2167,59 +2942,59 @@ function StatsPage({ token, brands }: { token: string; brands: Brand[] }) {
   return (
     <section className="space-y-4">
       <div className="rounded-lg border bg-white shadow-sm">
-        <div className="border-b p-5">
+        <div className="border-b p-4 sm:p-5">
           <h2 className="text-lg font-semibold text-slate-950">数据统计</h2>
         </div>
         {statsError && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{statsError}</p>}
       </div>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        <section className="rounded-lg border bg-white p-5 shadow-sm">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <section className="rounded-lg border bg-white p-4 shadow-sm sm:p-5">
+          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <h3 className="text-base font-semibold text-slate-950">品牌商品销量 Top5</h3>
-            <div className="flex shrink-0 gap-2">
-              <Select className="w-28" value={String(brandId || "")} onChange={(event) => setBrandId(Number(event.target.value))}>
+            <div className="grid grid-cols-2 gap-2 sm:flex sm:shrink-0">
+              <Select className="w-full sm:w-28" value={String(brandId || "")} onChange={(event) => setBrandId(Number(event.target.value))}>
                 {brands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}
               </Select>
-              <Select className="w-24" value={String(brandDays)} onChange={(event) => setBrandDays(Number(event.target.value))}>
+              <Select className="w-full sm:w-24" value={String(brandDays)} onChange={(event) => setBrandDays(Number(event.target.value))}>
                 <option value="7">7天</option>
                 <option value="15">15天</option>
                 <option value="30">30天</option>
               </Select>
             </div>
           </div>
-          <EChart option={brandSalesOption} className="h-[360px]" />
+          <EChart option={brandSalesOption} className="h-[300px] sm:h-[360px]" />
         </section>
 
-        <section className="rounded-lg border bg-white p-5 shadow-sm">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <section className="rounded-lg border bg-white p-4 shadow-sm sm:p-5">
+          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <h3 className="text-base font-semibold text-slate-950">全部商品销量 Top10</h3>
-            <div className="flex shrink-0 gap-2">
-              <Select className="w-24" value={String(topDays)} onChange={(event) => setTopDays(Number(event.target.value))}>
+            <div className="grid gap-2 sm:flex sm:shrink-0">
+              <Select className="w-full sm:w-24" value={String(topDays)} onChange={(event) => setTopDays(Number(event.target.value))}>
                 <option value="7">7天</option>
                 <option value="15">15天</option>
                 <option value="30">30天</option>
               </Select>
             </div>
           </div>
-          <EChart option={topSalesOption} className="h-[360px]" />
+          <EChart option={topSalesOption} className="h-[300px] sm:h-[360px]" />
         </section>
       </div>
 
-      <section className="rounded-lg border bg-white p-5 shadow-sm">
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <section className="rounded-lg border bg-white p-4 shadow-sm sm:p-5">
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <h3 className="text-base font-semibold text-slate-950">总销量趋势</h3>
-          <div className="flex shrink-0 gap-2">
-            <Select className="w-36" value={trendPeriod} onChange={(event) => setTrendPeriod(event.target.value)}>
+          <div className="grid gap-2 sm:flex sm:shrink-0">
+            <Select className="w-full sm:w-36" value={trendPeriod} onChange={(event) => setTrendPeriod(event.target.value)}>
               <option value="day">日（15日内）</option>
               <option value="week">周（8周）</option>
               <option value="month">月（6个月内）</option>
             </Select>
             <details className="relative">
-              <summary className="flex h-10 w-40 cursor-pointer list-none items-center justify-between rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-700">
+              <summary className="flex h-10 w-full cursor-pointer list-none items-center justify-between rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-700 sm:w-40">
                 已选 {trendBrandIds.length || brands.length} 个品牌
               </summary>
-              <div className="absolute right-0 z-20 mt-2 w-64 rounded-md border border-slate-200 bg-white p-3 shadow-lg">
+              <div className="absolute right-0 z-20 mt-2 w-64 max-w-[calc(100vw-2rem)] rounded-md border border-slate-200 bg-white p-3 shadow-lg">
                 <div className="mb-2 flex justify-between text-sm">
                   <button type="button" className="text-blue-600 hover:underline" onClick={() => setTrendBrandIds(brands.map((brand) => brand.id))}>全选</button>
                   <button type="button" className="text-blue-600 hover:underline" onClick={() => setTrendBrandIds([])}>清空</button>
@@ -2236,7 +3011,7 @@ function StatsPage({ token, brands }: { token: string; brands: Brand[] }) {
             </details>
           </div>
         </div>
-        <EChart option={trendOption} className="h-[380px]" />
+        <EChart option={trendOption} className="h-[300px] sm:h-[380px]" />
       </section>
     </section>
   );
@@ -2244,6 +3019,26 @@ function StatsPage({ token, brands }: { token: string; brands: Brand[] }) {
 
 function formatMoney(value: number) {
   return `¥${Number(value || 0).toFixed(2)}`;
+}
+
+function PlatformAmountBreakdown({ amounts }: { amounts?: { douyin: number; pinduoduo: number; none: number } }) {
+  if (!amounts) return null;
+  return (
+    <div className="mt-1 space-y-0.5 text-xs font-normal text-slate-500">
+      <div>拼多多：{formatMoney(amounts.pinduoduo || 0)}</div>
+      <div>抖音：{formatMoney(amounts.douyin || 0)}</div>
+      {Number(amounts.none || 0) !== 0 && <div>未选择：{formatMoney(amounts.none || 0)}</div>}
+    </div>
+  );
+}
+
+function InfoLine({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex items-start justify-between gap-3 text-sm">
+      <span className="shrink-0 text-slate-500">{label}</span>
+      <span className="min-w-0 text-right text-slate-900">{value}</span>
+    </div>
+  );
 }
 
 type AmountRow = {
@@ -2255,9 +3050,14 @@ type AmountRow = {
   skuName: string;
   quantity: number;
   amount: number;
+  brandPlatformAmounts?: {
+    douyin: number;
+    pinduoduo: number;
+    none: number;
+  };
 };
 
-function AmountTable({ rows, quantityTitle, amountTitle }: { rows: AmountRow[]; quantityTitle: string; amountTitle: string }) {
+function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown = false }: { rows: AmountRow[]; quantityTitle: string; amountTitle: string; showPlatformBreakdown?: boolean }) {
   const [expandedProducts, setExpandedProducts] = useState<Set<string>>(() => new Set());
   const productGroups = useMemo(() => {
     const groups = new Map<string, AmountRow[]>();
@@ -2290,6 +3090,36 @@ function AmountTable({ rows, quantityTitle, amountTitle }: { rows: AmountRow[]; 
     for (const row of rows) totals.set(row.brandId, (totals.get(row.brandId) || 0) + row.amount);
     return totals;
   }, [rows]);
+  const brandPlatformAmounts = useMemo(() => {
+    const amounts = new Map<number, { douyin: number; pinduoduo: number; none: number }>();
+    for (const row of rows) {
+      if (row.brandPlatformAmounts && !amounts.has(row.brandId)) amounts.set(row.brandId, row.brandPlatformAmounts);
+    }
+    return amounts;
+  }, [rows]);
+  const mobileBrandGroups = useMemo(() => {
+    const groups = new Map<number, {
+      brandId: number;
+      brandName: string;
+      totalAmount: number;
+      platformAmounts?: { douyin: number; pinduoduo: number; none: number };
+      products: typeof productGroups;
+    }>();
+
+    for (const group of pageGroups) {
+      const current = groups.get(group.brandId) || {
+        brandId: group.brandId,
+        brandName: group.brandName,
+        totalAmount: brandTotals.get(group.brandId) || 0,
+        platformAmounts: brandPlatformAmounts.get(group.brandId),
+        products: [],
+      };
+      current.products.push(group);
+      groups.set(group.brandId, current);
+    }
+
+    return [...groups.values()];
+  }, [pageGroups, brandTotals, brandPlatformAmounts, productGroups]);
   const visibleBrandSpan = (startIndex: number) => {
     const brandId = pageGroups[startIndex]?.brandId;
     let span = 0;
@@ -2308,7 +3138,65 @@ function AmountTable({ rows, quantityTitle, amountTitle }: { rows: AmountRow[]; 
   };
 
   return (
-    <div className="overflow-auto p-5">
+    <div className="p-3 sm:p-5">
+      <div className="grid gap-3 md:hidden">
+        {mobileBrandGroups.map((brand) => (
+          <div key={brand.brandId} className="rounded-lg border border-slate-200 bg-white shadow-sm">
+            <div className="flex items-start justify-between gap-3 border-b bg-slate-50 px-3 py-2">
+              <div>
+                <h3 className="font-semibold text-slate-950">{brand.brandName}</h3>
+                {showPlatformBreakdown && <PlatformAmountBreakdown amounts={brand.platformAmounts} />}
+              </div>
+              <span className="shrink-0 rounded-md bg-blue-50 px-2 py-1 text-sm font-semibold text-blue-700">
+                {formatMoney(brand.totalAmount)}
+              </span>
+            </div>
+            <div className="divide-y divide-slate-100">
+              {brand.products.map((product) => {
+                const expanded = expandedProducts.has(product.key);
+                return (
+                  <div key={product.key} className="p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <button
+                        type="button"
+                        className="flex min-w-0 items-center gap-2 text-left font-semibold text-slate-900"
+                        onClick={() => toggleProduct(product.key)}
+                      >
+                        <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded border border-slate-300 text-slate-600">
+                          {expanded ? <Minus className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                        </span>
+                        <span className="truncate">{product.productName}</span>
+                      </button>
+                      <span className="shrink-0 text-sm font-medium text-slate-900">{formatMoney(product.totalAmount)}</span>
+                    </div>
+                    {expanded && (
+                      <table className="mt-2 w-full table-fixed border-collapse text-sm">
+                        <thead>
+                          <tr className="text-left text-xs text-slate-500">
+                            <th className="border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">规格名</th>
+                            <th className="w-20 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">{quantityTitle}</th>
+                            <th className="w-24 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">{amountTitle}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {product.rows.map((row) => (
+                            <tr key={row.skuId}>
+                              <td className="break-words border border-slate-200 px-2 py-1.5">{row.skuName}</td>
+                              <td className="border border-slate-200 px-2 py-1.5">{row.quantity}</td>
+                              <td className="border border-slate-200 px-2 py-1.5">{formatMoney(row.amount)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="hidden overflow-auto md:block">
       <table className={`${tableBase} min-w-[760px]`}>
         <thead>
           <tr>
@@ -2338,7 +3226,12 @@ function AmountTable({ rows, quantityTitle, amountTitle }: { rows: AmountRow[]; 
                     {group.productName}
                   </td>
                   <td className={tdBase}>{formatMoney(productTotals.get(group.productId) || 0)}</td>
-                  {brandSpan > 0 && <td className={tdBase} rowSpan={brandSpan}>{formatMoney(brandTotals.get(group.brandId) || 0)}</td>}
+                  {brandSpan > 0 && (
+                    <td className={tdBase} rowSpan={brandSpan}>
+                      <div>{formatMoney(brandTotals.get(group.brandId) || 0)}</div>
+                      {showPlatformBreakdown && <PlatformAmountBreakdown amounts={brandPlatformAmounts.get(group.brandId)} />}
+                    </td>
+                  )}
                 </tr>
                 {expanded && (
                   <tr>
@@ -2369,12 +3262,15 @@ function AmountTable({ rows, quantityTitle, amountTitle }: { rows: AmountRow[]; 
           })}
         </tbody>
       </table>
+      </div>
       <PaginationBar {...pagination} onPageChange={pagination.setPage} />
     </div>
   );
 }
 
-function InventoryAmountPage({ rows }: { rows: SkuInventoryRow[] }) {
+function InventoryAmountPage({ rows, token }: { rows: SkuInventoryRow[]; token: string }) {
+  const [exporting, setExporting] = useState(false);
+  const [error, setError] = useState("");
   const amountRows = useMemo<AmountRow[]>(
     () =>
       rows.map((row) => {
@@ -2397,12 +3293,38 @@ function InventoryAmountPage({ rows }: { rows: SkuInventoryRow[] }) {
     [amountRows],
   );
 
+  async function exportInventoryAmount() {
+    setExporting(true);
+    try {
+      const blob = await api.exportInventoryAmount(token);
+      const now = new Date();
+      const fileName = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日${now.getHours()}时${now.getMinutes()}分_库存金额.xlsx`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setError("");
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "库存金额导出失败");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="flex items-center justify-between gap-4 border-b p-5">
+      <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
         <h2 className="text-lg font-semibold text-slate-950">库存金额</h2>
-        <div className="text-sm font-medium text-slate-900">总金额：{formatMoney(totalAmount)}</div>
+        <div className="flex items-center justify-between gap-3 sm:justify-end">
+          <div className="text-sm font-medium text-slate-900">总金额：{formatMoney(totalAmount)}</div>
+          <Button onClick={() => void exportInventoryAmount()} disabled={exporting}>{exporting ? "导出中" : "导出"}</Button>
+        </div>
       </div>
+      {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
       <AmountTable rows={amountRows} quantityTitle="库存总量" amountTitle="库存金额" />
     </section>
   );
@@ -2421,6 +3343,7 @@ function SalesAmountPage({ token }: { token: string }) {
   const [endDate, setEndDate] = useState(() => formatDateInput(new Date()));
   const [rows, setRows] = useState<AmountRow[]>([]);
   const [error, setError] = useState("");
+  const [exporting, setExporting] = useState(false);
 
   useEffect(() => {
     api.salesAmount(token, startDate, endDate)
@@ -2434,35 +3357,63 @@ function SalesAmountPage({ token }: { token: string }) {
           skuName: row.skuName,
           quantity: Number(row.salesQty),
           amount: Number(row.costAmount),
+          brandPlatformAmounts: row.brandPlatformAmounts
+            ? {
+                douyin: Number(row.brandPlatformAmounts.douyin || 0),
+                pinduoduo: Number(row.brandPlatformAmounts.pinduoduo || 0),
+                none: Number(row.brandPlatformAmounts.none || 0),
+              }
+            : undefined,
         })));
         setError("");
       })
       .catch((nextError) => setError(nextError instanceof Error ? nextError.message : "销售金额加载失败"));
   }, [token, startDate, endDate]);
 
+  async function exportSalesAmount() {
+    setExporting(true);
+    try {
+      const blob = await api.exportSalesAmount(token, startDate, endDate);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `销售金额-${startDate}-至-${endDate}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setError("");
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "销售金额导出失败");
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <section className="rounded-lg border bg-white shadow-sm">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
+      <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
         <div className="flex flex-wrap items-baseline gap-2">
           <h2 className="text-lg font-semibold text-slate-950">销售金额</h2>
           <span className="text-xs text-slate-400">出库金额-退货入库金额</span>
         </div>
-        <div className="flex items-center gap-2">
-          <Input className="w-40" type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} />
+        <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 sm:flex">
+          <Input className="w-full sm:w-40" type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} />
           <span className="text-sm text-slate-500">至</span>
-          <Input className="w-40" type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} />
+          <Input className="w-full sm:w-40" type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} />
+          <Button className="col-span-3 w-full sm:w-auto" onClick={() => void exportSalesAmount()} disabled={exporting}>{exporting ? "导出中" : "导出"}</Button>
         </div>
       </div>
       {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-      <AmountTable rows={rows} quantityTitle="销售数量" amountTitle="成本金额" />
+      <AmountTable rows={rows} quantityTitle="销售数量" amountTitle="成本金额" showPlatformBreakdown />
     </section>
   );
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-3 text-sm font-medium text-slate-700">
-      <span className="w-28 shrink-0 text-right text-slate-600">{label}</span>
+    <div className="flex flex-col gap-1.5 text-sm font-medium text-slate-700 sm:flex-row sm:items-center sm:gap-3">
+      <span className="shrink-0 text-slate-600 sm:w-28 sm:text-right">{label}</span>
       <span className="min-w-0 flex-1">{children}</span>
     </div>
   );
@@ -2556,16 +3507,17 @@ function EditorDialog({
   const skuOptions = (modalSkus.length ? modalSkus : []).filter((sku) => !sku.isHidden);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/40 p-4">
-      <form onSubmit={onSubmit} className="w-full max-w-xl rounded-lg bg-white p-5 shadow-xl">
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/40 p-3 sm:items-center sm:p-4">
+      <form onSubmit={onSubmit} className="max-h-[calc(100vh-1.5rem)] w-full max-w-xl overflow-y-auto rounded-lg bg-white p-4 shadow-xl sm:max-h-[calc(100vh-2rem)] sm:p-5">
         <div className="mb-4 flex items-center justify-between">
-          <h3 className="text-lg font-semibold">{dialog === "inbound" ? "入库" : dialog === "outbound" ? "出库" : editingId ? "修改" : "新增"}</h3>
+          <h3 className="text-lg font-semibold">{dialog === "inbound" ? "入库" : dialog === "outbound" ? "出库" : dialog === "abnormal" ? "异常库存" : editingId ? "修改" : "新增"}</h3>
           <Button variant="ghost" size="sm" onClick={onClose}>关闭</Button>
         </div>
         <div className="grid gap-3">
           {dialog === "user" && (
             <>
               <Field label="英文用户名"><Input value={form.username || ""} onChange={(event) => onChange("username", event.target.value)} required pattern="[A-Za-z][A-Za-z0-9_]{2,31}" /></Field>
+              <Field label="邮箱"><Input type="email" value={form.email || ""} onChange={(event) => onChange("email", event.target.value)} /></Field>
               <Field label="真实姓名"><Input value={form.name || ""} onChange={(event) => onChange("name", event.target.value)} required /></Field>
               {editingId ? (
                 <Field label="密码（留空则不修改）"><PasswordInput value={form.password || ""} onChange={(value) => onChange("password", value)} /></Field>
@@ -2601,7 +3553,7 @@ function EditorDialog({
               <Field label="备注"><Input value={form.remark || ""} onChange={(event) => onChange("remark", event.target.value)} /></Field>
             </>
           )}
-          {(dialog === "inbound" || dialog === "outbound") && (
+          {(dialog === "inbound" || dialog === "outbound" || dialog === "abnormal") && (
             <>
               <Field label="品牌名"><Select value={String(form.brandId || "")} onChange={(event) => void onBrandChange(Number(event.target.value))} required>{activeBrands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}</Select></Field>
               <Field label="商品名">
@@ -2635,33 +3587,37 @@ function EditorDialog({
               </Field>
               <Field label="数量">
                 <div className="space-y-1">
-                  <Input type="number" min="1" step="1" value={form.quantity || 1} onChange={(event) => onChange("quantity", event.target.value)} required />
-                  {dialog === "outbound" && currentStock !== null && (
+                  <Input type="number" min={dialog === "abnormal" ? undefined : "1"} step="1" value={form.quantity || 1} onChange={(event) => onChange("quantity", event.target.value)} required />
+                  {(dialog === "outbound" || dialog === "abnormal") && currentStock !== null && (
                     <p className="text-xs font-medium text-red-600">
                       当前库存数：{currentStock.salableQty}
                     </p>
                   )}
                 </div>
               </Field>
-              {dialog === "inbound" && <Field label="类型"><Select value={form.inboundType || "return"} onChange={(event) => onChange("inboundType", event.target.value)}><option value="return">退货</option><option value="new">新货</option></Select></Field>}
-              <Field label="平台">
+              {dialog === "inbound" && <Field label="类型"><Select value={form.inboundType || "new"} onChange={(event) => onChange("inboundType", event.target.value)}><option value="new">新货</option><option value="return">退货</option></Select></Field>}
+              {(dialog === "inbound" || dialog === "outbound") && <Field label="平台">
                 <Select value={form.platform || ""} onChange={(event) => onChange("platform", event.target.value)}>
                   <option value=""></option>
                   <option value="douyin">抖音</option>
                   <option value="pinduoduo">拼多多</option>
                 </Select>
-              </Field>
+              </Field>}
               {dialog === "inbound" && <Field label="标签">
                 <StockLabelPicker value={form.label || "salable"} onChange={(value) => onChange("label", value)}>
                 </StockLabelPicker>
               </Field>}
-              <Field label="备注"><Input value={form.remark || ""} onChange={(event) => onChange("remark", event.target.value)} /></Field>
+              {dialog === "abnormal" ? (
+                <Field label="原因"><Input value={form.reason || ""} onChange={(event) => onChange("reason", event.target.value)} required /></Field>
+              ) : (
+                <Field label="备注"><Input value={form.remark || ""} onChange={(event) => onChange("remark", event.target.value)} /></Field>
+              )}
             </>
           )}
         </div>
         <div className="mt-5 flex justify-end gap-2">
-          <Button variant="secondary" onClick={onClose}>取消</Button>
-          <Button type="submit">确定</Button>
+          <Button className="flex-1 sm:flex-none" variant="secondary" onClick={onClose}>取消</Button>
+          <Button className="flex-1 sm:flex-none" type="submit">确定</Button>
         </div>
       </form>
     </div>
