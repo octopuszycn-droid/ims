@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { EChartsOption } from "echarts";
-import { Eye, EyeOff, GripVertical, Loader2, Menu, Minus, PencilLine, Plus, X } from "lucide-react";
+import { Download, Eye, EyeOff, GripVertical, Loader2, Menu, Minus, PencilLine, Plus, X } from "lucide-react";
 import { ApiError, api } from "./api";
 import type {
   Brand,
@@ -2526,6 +2526,8 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
   const [abnormalLogs, setAbnormalLogs] = useState<InventoryAbnormalLog[]>([]);
   const [abnormalTotal, setAbnormalTotal] = useState(0);
   const [abnormalPage, setAbnormalPage] = useState(1);
+  const [abnormalDateRange, setAbnormalDateRange] = useState({ startAt: "", endAt: "" });
+  const [isExportingAbnormal, setIsExportingAbnormal] = useState(false);
   const [selectedRecord, setSelectedRecord] = useState<InventoryCheckRecord | null>(null);
   const [detailRows, setDetailRows] = useState<InventoryCheckDifference[]>([]);
   const [loading, setLoading] = useState(false);
@@ -2553,15 +2555,33 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
     }
   }
 
-  async function loadAbnormalLogs(nextPage = abnormalPage) {
+  async function loadAbnormalLogs(nextPage = abnormalPage, range = abnormalDateRange) {
     setError("");
     try {
-      const result = await api.abnormalLogs(token, nextPage, abnormalPageSize);
+      const result = await api.abnormalLogs(token, nextPage, abnormalPageSize, range);
       setAbnormalLogs(result.rows);
       setAbnormalTotal(result.total);
       setAbnormalPage(nextPage);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "异常库存记录加载失败");
+    }
+  }
+
+  async function exportAbnormalLogs() {
+    setIsExportingAbnormal(true);
+    setError("");
+    try {
+      const blob = await api.exportAbnormalLogs(token, abnormalDateRange);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `异常库存记录_${abnormalDateRange.startAt || "不限"}_至_${abnormalDateRange.endAt || "不限"}.xlsx`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "异常库存记录导出失败");
+    } finally {
+      setIsExportingAbnormal(false);
     }
   }
 
@@ -2893,8 +2913,25 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
       </section>
 
       <section className="rounded-lg border bg-white shadow-sm">
-        <div className="border-b p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b p-5">
           <h2 className="text-lg font-semibold text-slate-950">异常库存记录</h2>
+          <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
+            <DateRangePicker2
+              filters={abnormalDateRange}
+              onChange={(range) => {
+                setAbnormalDateRange(range);
+                void loadAbnormalLogs(1, range);
+              }}
+              onClear={() => {
+                const range = { startAt: "", endAt: "" };
+                setAbnormalDateRange(range);
+                void loadAbnormalLogs(1, range);
+              }}
+            />
+            <Button onClick={() => void exportAbnormalLogs()} disabled={isExportingAbnormal}>
+              <Download className="mr-2 h-4 w-4" />{isExportingAbnormal ? "导出中" : "导出"}
+            </Button>
+          </div>
         </div>
         <div className="p-3 sm:p-5">
           <div className="grid gap-3 md:hidden">

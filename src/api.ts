@@ -180,12 +180,20 @@ export const api = {
   abnormalInventory(token: string, payload: Record<string, unknown>) {
     return request("/api/inventory/abnormal", { method: "POST", token, body: JSON.stringify(payload) });
   },
-  abnormalLogs(token: string, page = 1, size = 20) {
+  abnormalLogs(token: string, page = 1, size = 20, range: { startAt?: string; endAt?: string } = {}) {
     const params = new URLSearchParams({
       limit: String(size),
       offset: String((Math.max(1, page) - 1) * size),
     });
+    if (range.startAt) params.set("startAt", range.startAt);
+    if (range.endAt) params.set("endAt", range.endAt);
     return request<{ rows: InventoryAbnormalLog[]; total: number }>(`/api/inventory/abnormal-logs?${params.toString()}`, { token });
+  },
+  exportAbnormalLogs(token: string, range: { startAt?: string; endAt?: string } = {}) {
+    const params = new URLSearchParams();
+    if (range.startAt) params.set("startAt", range.startAt);
+    if (range.endAt) params.set("endAt", range.endAt);
+    return requestBlob(`/api/inventory/abnormal-logs/export${params.size ? `?${params.toString()}` : ""}`, { token });
   },
   revokeInventoryLog(token: string, id: number) {
     return request("/api/inventory/logs/" + id, { method: "DELETE", token });

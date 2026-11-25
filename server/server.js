@@ -1184,13 +1184,32 @@ app.get("/api/inventory/logs", requireAuth, readScope, async (req, res, next) =>
   }
 });
 
-async function queryInventoryAbnormalLogs(paging = {}) {
+function buildInventoryAbnormalLogFilters(source = {}) {
+  const conditions = [];
+  const params = [];
+  const startAt = normalizeDateTimeFilter(source.startAt, "起始日期", "start");
+  const endAt = normalizeDateTimeFilter(source.endAt, "结束日期", "end");
+  if (startAt && endAt && startAt > endAt) throw badRequest("起始日期不能晚于结束日期");
+  if (startAt) {
+    conditions.push("l.created_at >= ?");
+    params.push(startAt);
+  }
+  if (endAt) {
+    conditions.push("l.created_at <= ?");
+    params.push(endAt);
+  }
+  return { whereSql: conditions.length ? ` where ${conditions.join(" and ")}` : "", params };
+}
+
+async function queryInventoryAbnormalLogs(filters = {}, paging = {}) {
+  const { whereSql, params } = buildInventoryAbnormalLogFilters(filters);
   const fromSql = `from inventory_abnormal_logs l
        join users u on u.id = l.operator_user_id
        join skus s on s.id = l.sku_id
        join products p on p.id = s.product_id
-       join brands b on b.id = p.brand_id`;
-  const [totalRow] = await query(`select count(*) as total ${fromSql}`);
+       join brands b on b.id = p.brand_id
+       ${whereSql}`;
+  const [totalRow] = await query(`select count(*) as total ${fromSql}`, params);
   const limitSql = paging.limit ? " limit ? offset ?" : "";
   const limitParams = paging.limit ? [paging.limit, paging.offset || 0] : [];
   const rows = await query(
@@ -1198,7 +1217,7 @@ async function queryInventoryAbnormalLogs(paging = {}) {
         u.name as operatorName, b.name as brandName, p.name as productName, s.name as skuName
        ${fromSql}
        order by l.id desc${limitSql}`,
-    limitParams,
+    [...params, ...limitParams],
   );
   return { rows, total: Number(totalRow?.total || 0) };
 }
@@ -1207,7 +1226,43 @@ app.get("/api/inventory/abnormal-logs", requireAuth, readScope, async (req, res,
   try {
     const limit = normalizePageLimit(req.query.limit);
     const offset = normalizeOffset(req.query.offset);
-    res.json(await queryInventoryAbnormalLogs({ limit, offset }));
+    res.json(await queryInventoryAbnormalLogs(req.query, { limit, offset }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/inventory/abnormal-logs/export", requireAuth, readScope, async (req, res, next) => {
+  try {
+    const { rows } = await queryInventoryAbnormalLogs(req.query);
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("异常库存记录");
+    worksheet.columns = [
+      { header: "时间", key: "createdAt", width: 22 },
+      { header: "品牌名", key: "brandName", width: 18 },
+      { header: "商品名", key: "productName", width: 22 },
+      { header: "规格名", key: "skuName", width: 18 },
+      { header: "数量", key: "quantity", width: 12 },
+      { header: "原因", key: "reason", width: 28 },
+      { header: "操作人", key: "operatorName", width: 16 },
+    ];
+    worksheet.addRows(rows.map((row) => ({ ...row, quantity: `${Number(row.quantity) > 0 ? "+" : ""}${row.quantity}${Number(row.stockLabel) === 2 ? "（不可售）" : ""}` })));
+    worksheet.getRow(1).font = { bold: true, color: { argb: "FF334155" } };
+    worksheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF1F5F9" } };
+    worksheet.eachRow((row) => {
+      row.eachCell((cell) => {
+        cell.border = {
+          top: { style: "thin", color: { argb: "FFE2E8F0" } },
+          left: { style: "thin", color: { argb: "FFE2E8F0" } },
+          bottom: { style: "thin", color: { argb: "FFE2E8F0" } },
+          right: { style: "thin", color: { argb: "FFE2E8F0" } },
+        };
+      });
+    });
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=inventory-abnormal-logs.xlsx");
+    res.send(Buffer.from(buffer));
   } catch (error) {
     next(error);
   }
