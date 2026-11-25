@@ -17,11 +17,13 @@ export type Session = {
   permissions: PermissionCode[];
 };
 
+export type PlatformValue = "douyin" | "pinduoduo" | "kuaishou" | "";
+
 export type Brand = {
   id: number;
   name: string;
   remark: string;
-  defaultPlatform: "douyin" | "pinduoduo" | "";
+  defaultPlatform: PlatformValue;
   sortOrder: number;
   isHidden: 0 | 1;
 };
@@ -84,7 +86,7 @@ export type InventoryLog = {
   stockLabel: 1 | 2;
   quantity: number;
   simultaneousInbound: 0 | 1;
-  platform: "douyin" | "pinduoduo" | "";
+  platform: PlatformValue;
   remark: string;
   createdAt: string;
   operatorName: string;
@@ -92,6 +94,11 @@ export type InventoryLog = {
   productName: string;
   skuName: string;
   canRevoke: 0 | 1 | boolean;
+  orderId?: string | null;
+  shopName?: string | null;
+  shopIncome?: number | null;
+  isBug?: 0 | 1 | boolean;
+  sourceProductText?: string | null;
 };
 
 export type InventoryLogFilters = {
@@ -102,12 +109,13 @@ export type InventoryLogFilters = {
   productId: number | "";
   inboundType: "" | "1" | "2";
   stockLabel: "" | "1" | "2";
-  platform: "" | "douyin" | "pinduoduo";
+  platform: PlatformValue;
 };
 
 export type InventoryAbnormalLog = {
   id: number;
   quantity: number;
+  stockLabel: 1 | 2;
   reason: string;
   createdAt: string;
   operatorName: string;
@@ -177,6 +185,7 @@ export type SalesAmountRow = {
   brandPlatformAmounts?: {
     douyin: number;
     pinduoduo: number;
+    kuaishou: number;
     none: number;
   };
 };

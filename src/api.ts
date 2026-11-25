@@ -123,6 +123,9 @@ export const api = {
   createSku(token: string, payload: Record<string, unknown>) {
     return request<{ id: number }>("/api/skus", { method: "POST", token, body: JSON.stringify(payload) });
   },
+  createSkusBatch(token: string, productId: number, rows: Array<Record<string, unknown>>) {
+    return request<{ ids: number[] }>("/api/skus/batch", { method: "POST", token, body: JSON.stringify({ productId, rows }) });
+  },
   updateSku(token: string, id: number, payload: Record<string, unknown>) {
     return request("/api/skus/" + id, { method: "PUT", token, body: JSON.stringify(payload) });
   },
@@ -165,6 +168,15 @@ export const api = {
   outbound(token: string, payload: Record<string, unknown>) {
     return request("/api/inventory/outbound", { method: "POST", token, body: JSON.stringify(payload) });
   },
+  inventoryOperationsBatch(token: string, mode: "in" | "out", rows: Array<Record<string, unknown>>) {
+    return request<{ results: Array<{ id: number; salableQty: number; unsalableQty: number }> }>("/api/inventory/operations/batch", { method: "POST", token, body: JSON.stringify({ mode, rows }) });
+  },
+  syncImportedOrders(token: string, platform: string, orders: Array<Record<string, unknown>>) {
+    return request<{ results: Array<{ id: number; isBug?: boolean }> }>("/api/inventory/orders/sync", { method: "POST", token, body: JSON.stringify({ platform, orders }) });
+  },
+  resolveImportedOrder(token: string, id: number, skuId: number) {
+    return request("/api/inventory/orders/" + id + "/resolve", { method: "PATCH", token, body: JSON.stringify({ skuId }) });
+  },
   abnormalInventory(token: string, payload: Record<string, unknown>) {
     return request("/api/inventory/abnormal", { method: "POST", token, body: JSON.stringify(payload) });
   },
@@ -183,6 +195,12 @@ export const api = {
   },
   exportInventoryDetail(token: string) {
     return requestBlob("/api/excel/export/inventory-detail", { token });
+  },
+  exportSkus(token: string, filters: { brandId?: number | ""; productId?: number | "" } = {}) {
+    const params = new URLSearchParams();
+    if (filters.brandId) params.set("brandId", String(filters.brandId));
+    if (filters.productId) params.set("productId", String(filters.productId));
+    return requestBlob(`/api/excel/export/skus${params.size ? `?${params.toString()}` : ""}`, { token });
   },
   exportInventoryAmount(token: string) {
     return requestBlob("/api/excel/export/inventory-amount", { token });

@@ -40,7 +40,7 @@ create table if not exists `brands` (
   `id` bigint unsigned not null auto_increment comment '品牌ID',
   `name` varchar(30) not null comment '品牌名，最多15个汉字',
   `remark` varchar(255) not null default '' comment '备注',
-  `default_platform` tinyint unsigned null comment '默认平台：1抖音，2拼多多，为空表示未选择',
+  `default_platform` tinyint unsigned null comment '默认平台：1抖音，2拼多多，3快手，为空表示未选择',
   `sort_order` int not null default 0 comment '排序值，升序',
   `is_hidden` tinyint unsigned not null default 0 comment '是否隐藏：0否，1是',
   `created_at` datetime not null default current_timestamp comment '创建时间',
@@ -96,14 +96,19 @@ create table if not exists `sku_inventory` (
 
 create table if not exists `inventory_operation_logs` (
   `id` bigint unsigned not null auto_increment comment '库存操作日志ID',
-  `sku_id` bigint unsigned not null comment 'SKU ID',
+  `sku_id` bigint unsigned null comment 'SKU ID；打单未匹配时为空',
   `operation_type` tinyint unsigned not null comment '操作类型：1入库，2出库',
   `inbound_type` tinyint unsigned null comment '入库类型：1新货，2退货；出库为空',
   `stock_label` tinyint unsigned not null comment '库存标签：1可售库存，2不可售库存',
-  `platform` tinyint unsigned null comment '平台：1抖音，2拼多多，为空表示未选择',
+  `platform` tinyint unsigned null comment '平台：1抖音，2拼多多，3快手，为空表示未选择',
   `quantity` int unsigned not null comment '操作数量',
   `simultaneous_inbound` tinyint unsigned not null default 0 comment '不可售出库时是否同时转入可售：0否，1是',
   `remark` varchar(255) not null default '' comment '备注',
+  `order_id` varchar(64) null comment '订单编号',
+  `shop_name` varchar(128) null comment '店铺名',
+  `shop_income` decimal(12,2) null comment '实收金额',
+  `is_bug` tinyint unsigned not null default 0 comment '商品匹配异常标记',
+  `source_product_text` varchar(1000) null comment '打单商品原始文本',
   `operator_user_id` bigint unsigned not null comment '操作人用户ID',
   `created_at` datetime not null default current_timestamp comment '创建时间',
   primary key (`id`),
@@ -114,7 +119,7 @@ create table if not exists `inventory_operation_logs` (
   constraint `chk_inventory_logs_operation_type` check (`operation_type` in (1, 2)),
   constraint `chk_inventory_logs_inbound_type` check (`inbound_type` is null or `inbound_type` in (1, 2)),
   constraint `chk_inventory_logs_stock_label` check (`stock_label` in (1, 2)),
-  constraint `chk_inventory_logs_platform` check (`platform` is null or `platform` in (1, 2)),
+  constraint `chk_inventory_logs_platform` check (`platform` is null or `platform` in (1, 2, 3)),
   constraint `chk_inventory_logs_quantity` check (`quantity` > 0),
   constraint `chk_inventory_logs_simultaneous` check (`simultaneous_inbound` in (0, 1))
 ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='库存操作日志表';
@@ -183,13 +188,21 @@ alter table `users` modify column `username` varchar(64) not null comment '英�
 create unique index if not exists `uk_users_username` on `users` (`username`);
 
 alter table `brands` add column if not exists `is_hidden` tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after `sort_order`;
-alter table `brands` add column if not exists `default_platform` tinyint unsigned null comment '默认平台：1抖音，2拼多多，为空表示未选择' after `remark`;
+alter table `brands` add column if not exists `default_platform` tinyint unsigned null comment '默认平台：1抖音，2拼多多，3快手，为空表示未选择' after `remark`;
 alter table `products` add column if not exists `is_hidden` tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after `sort_order`;
 alter table `skus` add column if not exists `is_hidden` tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after `sort_order`;
 alter table `sku_inventory` drop constraint if exists `chk_sku_inventory_qty`;
 alter table `sku_inventory` modify column `salable_qty` int not null default 0 comment '可售库存数';
 alter table `sku_inventory` modify column `unsalable_qty` int not null default 0 comment '不可售库存数';
-alter table `inventory_operation_logs` add column if not exists `platform` tinyint unsigned null comment '平台：1抖音，2拼多多，为空表示未选择' after `stock_label`;
+alter table `inventory_operation_logs` add column if not exists `platform` tinyint unsigned null comment '平台：1抖音，2拼多多，3快手，为空表示未选择' after `stock_label`;
+alter table `inventory_operation_logs` modify column `sku_id` bigint unsigned null comment 'SKU ID；打单匹配失败时为空';
+alter table `inventory_operation_logs` add column if not exists `order_id` varchar(64) null comment '订单编号';
+alter table `inventory_operation_logs` add column if not exists `shop_name` varchar(128) null comment '店铺名';
+alter table `inventory_operation_logs` add column if not exists `shop_income` decimal(12,2) null comment '实收金额';
+alter table `inventory_operation_logs` add column if not exists `is_bug` tinyint unsigned not null default 0 comment '商品匹配异常标记';
+alter table `inventory_operation_logs` add column if not exists `source_product_text` varchar(1000) null comment '打单商品原始文本';
+alter table `inventory_operation_logs` drop constraint if exists `chk_inventory_logs_platform`;
+alter table `inventory_operation_logs` add constraint `chk_inventory_logs_platform` check (`platform` is null or `platform` in (1, 2, 3));
 alter table `inventory_checks` add column if not exists `upload_file_path` varchar(255) not null default '' comment '盘点上传原始文件相对路径' after `operator_user_id`;
 alter table `inventory_check_differences` add column if not exists `purchase_price_snapshot` decimal(10,2) not null default 0.00 comment '盘点时SKU购入价格快照' after `unsalable_diff_qty`;
 alter table `inventory_checks` add column if not exists `is_synced` tinyint unsigned not null default 0 comment 'whether differences have been synced' after `upload_file_path`;

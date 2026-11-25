@@ -10,6 +10,7 @@ import type {
   InventoryLog,
   InventoryLogFilters,
   PermissionCode,
+  PlatformValue,
   Product,
   ProductInventoryRow,
   ProductSalesBreakdown,
@@ -28,6 +29,8 @@ import { Select } from "./components/ui/select";
 
 const sessionKey = "fish-cms-session";
 const pageKey = "fish-cms-current-page";
+const outboundMemoryKey = "fish-cms-outbound-memory";
+const outboundMemoryTtlMs = 60 * 60 * 1000;
 const serverExpiryForceKey = "fish-cms-server-expiry-forced";
 const serverExpiryDate = "2027-06-01";
 const serverExpiryAt = new Date(`${serverExpiryDate}T00:00:00+08:00`).getTime();
@@ -68,6 +71,7 @@ type DialogType = null | "user" | "brand" | "product" | "sku" | "inbound" | "out
 type SkuFilters = { brandId: number | ""; productId: number | "" };
 type FilterBrandOption = { id: number; name: string };
 type FilterProductOption = { id: number; brandId: number; name: string };
+type OutboundMemory = { brandId: number | ""; platformByBrand: Record<string, PlatformValue>; updatedAt: number };
 
 type NavGroup = {
   label: string;
@@ -75,6 +79,44 @@ type NavGroup = {
   children?: Array<{ key: PageKey; label: string; required?: PermissionCode[] }>;
   key?: PageKey;
 };
+
+function readOutboundMemory(): OutboundMemory | null {
+  try {
+    const raw = window.localStorage.getItem(outboundMemoryKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as OutboundMemory;
+    if (!parsed.updatedAt || Date.now() - parsed.updatedAt > outboundMemoryTtlMs) {
+      window.localStorage.removeItem(outboundMemoryKey);
+      return null;
+    }
+    return { brandId: parsed.brandId || "", platformByBrand: parsed.platformByBrand || {}, updatedAt: parsed.updatedAt };
+  } catch {
+    return null;
+  }
+}
+
+function rememberOutboundSelection(brandId: number | "", platform: PlatformValue) {
+  if (!brandId) return;
+  const current = readOutboundMemory();
+  const next: OutboundMemory = {
+    brandId,
+    platformByBrand: { ...(current?.platformByBrand || {}), [String(brandId)]: platform || "" },
+    updatedAt: Date.now(),
+  };
+  window.localStorage.setItem(outboundMemoryKey, JSON.stringify(next));
+}
+
+function getOutboundBrand(brands: Brand[]) {
+  const activeBrands = brands.filter((brand) => !brand.isHidden);
+  const memory = readOutboundMemory();
+  return activeBrands.find((brand) => brand.id === memory?.brandId) || activeBrands[0] || null;
+}
+
+function getOutboundPlatform(brand?: Brand | null) {
+  if (!brand) return "";
+  const memory = readOutboundMemory();
+  return (memory?.platformByBrand?.[String(brand.id)] || brand.defaultPlatform || "") as PlatformValue;
+}
 
 const navGroups: NavGroup[] = [
   { key: "users", label: "用户管理", required: ["SUPER"] },
@@ -464,14 +506,14 @@ export function App() {
     setForm(
       sku
         ? { brandId, productId: sku.productId, name: sku.name, purchasePrice: sku.purchasePrice, remark: sku.remark }
-        : { brandId, productId: "", name: "", purchasePrice: "", remark: "" },
+        : { brandId, productId: "", name: "", purchasePrice: "", remark: "", rows: [{ name: "", purchasePrice: "", remark: "" }] },
     );
     setDialog("sku");
     if (brandId) await loadModalProducts(Number(brandId), sku?.productId);
   }
 
   async function openStockDialog(type: "inbound" | "outbound") {
-    const firstVisibleBrand = brands.find((brand) => !brand.isHidden);
+    const firstVisibleBrand = type === "outbound" ? getOutboundBrand(brands) : brands.find((brand) => !brand.isHidden);
     setEditingId(null);
     setCurrentStock(null);
     setForm({
@@ -482,8 +524,9 @@ export function App() {
       label: "salable",
       inboundType: "new",
       simultaneousInbound: false,
-      platform: type === "outbound" ? firstVisibleBrand?.defaultPlatform || "" : "",
+      platform: type === "outbound" ? getOutboundPlatform(firstVisibleBrand) : "",
       remark: "",
+      rows: [{ skuId: "", quantity: 1, platform: type === "outbound" ? getOutboundPlatform(firstVisibleBrand) : "", orderId: "", shopIncome: "", remark: "", inboundType: "new", label: "salable" }],
     });
     setDialog(type);
     if (firstVisibleBrand?.id) await loadModalProducts(firstVisibleBrand.id, undefined, false);
@@ -551,25 +594,37 @@ export function App() {
         };
         if (editingId) await api.updateSku(token, editingId, payload);
         else {
-          await api.createSku(token, payload);
+          const rows = Array.isArray(form.rows) ? form.rows : [];
+          if (!rows.length || rows.some((row: Record<string, unknown>) => !String(row.name || "").trim() || row.purchasePrice === "" || row.purchasePrice === undefined)) {
+            throw new Error("请完整填写每一行规格名和购入价格");
+          }
+          await api.createSkusBatch(token, Number(form.productId), rows.map((row: Record<string, unknown>) => ({
+            name: String(row.name || "").trim(),
+            purchasePrice: Number(row.purchasePrice),
+            remark: String(row.remark || "").trim(),
+          })));
           const product = products.find((item) => item.id === Number(form.productId)) || modalProducts.find((item) => item.id === Number(form.productId));
           nextSkuFilters = { brandId: product?.brandId ?? Number(form.brandId) ?? "", productId: Number(form.productId) };
         }
       }
       if (dialog === "inbound" || dialog === "outbound") {
         if (!Number(form.productId)) throw new Error("请选择商品名");
-        if (!Number(form.skuId)) throw new Error("请选择规格名");
-        const payload = {
-          skuId: Number(form.skuId),
-          quantity: Number(form.quantity),
-          label: dialog === "outbound" ? "salable" : form.label,
-          inboundType: form.inboundType,
-          simultaneousInbound: dialog === "outbound" ? false : Boolean(form.simultaneousInbound),
-          platform: form.platform || "",
-          remark: String(form.remark || "").trim(),
-        };
-        if (dialog === "inbound") await api.inbound(token, payload);
-        else await api.outbound(token, payload);
+        const rows = Array.isArray(form.rows) ? form.rows : [];
+        if (!rows.length || rows.some((row: Record<string, unknown>) => !Number(row.skuId) || !Number.isInteger(Number(row.quantity)) || Number(row.quantity) <= 0)) {
+          throw new Error("请完整填写每一行规格名和正整数数量");
+        }
+        await api.inventoryOperationsBatch(token, dialog === "inbound" ? "in" : "out", rows.map((row: Record<string, any>) => ({
+          skuId: Number(row.skuId),
+          quantity: Number(row.quantity),
+          label: dialog === "outbound" ? "salable" : row.label,
+          inboundType: dialog === "inbound" ? row.inboundType : "new",
+          simultaneousInbound: false,
+          platform: row.platform || "",
+          orderId: dialog === "outbound" ? String(row.orderId || "").trim() : "",
+          shopIncome: dialog === "outbound" ? row.shopIncome || null : null,
+          remark: String(row.remark || "").trim(),
+        })));
+        if (dialog === "outbound") rememberOutboundSelection(Number(form.brandId), (rows[rows.length - 1]?.platform || "") as PlatformValue);
       }
       if (dialog === "abnormal") {
         if (!Number(form.productId)) throw new Error("请选择商品名");
@@ -578,6 +633,7 @@ export function App() {
           skuId: Number(form.skuId),
           quantity: Number(form.quantity),
           reason: String(form.reason || "").trim(),
+          addToUnsalable: Number(form.quantity) < 0 && Boolean(form.addToUnsalable),
         };
         if (!payload.reason) throw new Error("请填写原因");
         await api.abnormalInventory(token, payload);
@@ -671,6 +727,24 @@ export function App() {
     }
   }
 
+  async function exportSkuList() {
+    if (!session) return;
+    setError("");
+    try {
+      const blob = await api.exportSkus(session.token, skuFilters);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `SKU管理-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "导出失败");
+    }
+  }
+
   async function exportInventoryLogs() {
     if (!session) return;
     setError("");
@@ -718,6 +792,17 @@ export function App() {
       await refreshData(session, logPage, logFilters);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "撤销失败");
+    }
+  }
+
+  async function resolveImportedOrder(log: InventoryLog, skuId: number) {
+    if (!session) return;
+    try {
+      await api.resolveImportedOrder(session.token, log.id, skuId);
+      setNotice("异常商品已补全并出库");
+      await refreshData(session);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "补全失败");
     }
   }
 
@@ -882,6 +967,7 @@ export function App() {
               onFilterChange={setSkuFilters}
               onFilterApply={(filters) => void loadSkuList(filters)}
               onAdd={() => void openSku()}
+              onExport={() => void exportSkuList()}
               onEdit={(sku) => void openSku(sku)}
               onToggleHidden={(sku) => toggleHidden("sku", sku)}
               onDragStart={setDragId}
@@ -913,6 +999,7 @@ export function App() {
               onFilterApply={(nextFilters) => void loadLogPage(1, session, nextFilters)}
               onExport={() => void exportInventoryLogs()}
               onRevoke={(log) => void revokeInventoryLog(log)}
+              onResolve={(log, skuId) => void resolveImportedOrder(log, skuId)}
               onReset={() => {
                 setLogFilterDraft(emptyLogFilters);
                 void loadLogPage(1, session, emptyLogFilters);
@@ -957,7 +1044,9 @@ export function App() {
             setCurrentStock(null);
             if (dialog === "inbound" || dialog === "outbound") {
               const selectedBrand = brands.find((brand) => brand.id === brandId);
-              patchForm("platform", dialog === "outbound" ? selectedBrand?.defaultPlatform || "" : "");
+              const nextPlatform = dialog === "outbound" ? getOutboundPlatform(selectedBrand) : "";
+              patchForm("platform", nextPlatform);
+              patchForm("rows", (form.rows || []).map((row: Record<string, unknown>) => ({ ...row, platform: nextPlatform })));
             }
             await loadModalProducts(brandId, undefined, shouldAutoPick);
           }}
@@ -1659,6 +1748,7 @@ function SkuTable({
   onFilterChange,
   onFilterApply,
   onAdd,
+  onExport,
   onEdit,
   onToggleHidden,
   onDragStart,
@@ -1671,6 +1761,7 @@ function SkuTable({
   onFilterChange: (filters: SkuFilters) => void;
   onFilterApply: (filters: SkuFilters) => void;
   onAdd: () => void;
+  onExport: () => void;
   onEdit: (sku: Sku) => void;
   onToggleHidden: (sku: Sku) => void;
   onDragStart: (id: number) => void;
@@ -1692,7 +1783,10 @@ function SkuTable({
             onFilterChange={onFilterChange}
             onFilterApply={onFilterApply}
           />
-          <Button className="w-full sm:w-auto" onClick={onAdd}>新增 SKU</Button>
+          <div className="grid grid-cols-2 gap-3 sm:flex sm:w-auto sm:flex-nowrap">
+            <Button className="w-full sm:w-auto" onClick={onAdd}>新增 SKU</Button>
+            <Button className="w-full sm:w-auto" onClick={onExport}>导出</Button>
+          </div>
         </div>
       </div>
       <div className="p-3 sm:p-5">
@@ -2184,6 +2278,7 @@ function LogTable({
   onFilterApply,
   onExport,
   onRevoke,
+  onResolve,
   onReset,
   onInbound,
   onOutbound,
@@ -2200,12 +2295,17 @@ function LogTable({
   onFilterApply: (filters: InventoryLogFilters) => void;
   onExport: () => void;
   onRevoke: (log: InventoryLog) => void;
+  onResolve: (log: InventoryLog, skuId: number) => void;
   onReset: () => void;
   onInbound: () => void;
   onOutbound: () => void;
   onAbnormal: () => void;
 }) {
   const [now, setNow] = useState(() => Date.now());
+  const [orderDialog, setOrderDialog] = useState<InventoryLog | null>(null);
+  const [resolveSkuId, setResolveSkuId] = useState("");
+  const [resolveBrandId, setResolveBrandId] = useState("");
+  const [resolveProductId, setResolveProductId] = useState("");
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const start = total ? (page - 1) * pageSize + 1 : 0;
   const end = Math.min(total, (page - 1) * pageSize + logs.length);
@@ -2311,6 +2411,7 @@ function LogTable({
             <option className="text-slate-400" value="">全部平台</option>
             <option className="text-slate-800" value="douyin">抖音</option>
             <option className="text-slate-800" value="pinduoduo">拼多多</option>
+            <option className="text-slate-800" value="kuaishou">快手</option>
           </Select>
           <Button className="w-full sm:w-auto" onClick={onExport}>导出</Button>
         </div>
@@ -2318,7 +2419,7 @@ function LogTable({
       <div className="p-3 sm:p-5">
         <div className="grid gap-3 md:hidden">
           {logs.map((log) => (
-            <article key={log.id} className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+            <article key={log.id} className={`rounded-lg border p-3 shadow-sm ${log.isBug ? "border-red-200 bg-red-50" : "border-slate-200 bg-white"}`}>
               <div className="mb-3 flex items-start justify-between gap-3">
                 <div>
                   <p className="text-xs text-slate-500">{String(log.createdAt).replace("T", " ").slice(0, 19)}</p>
@@ -2337,7 +2438,11 @@ function LogTable({
                 <InfoLine label="入库类型" value={log.operationType === 1 ? <InboundTypeText value={log.inboundType} /> : "-"} />
                 <InfoLine label="操作人" value={log.operatorName} />
                 <InfoLine label="备注" value={log.remark || "-"} />
+                {log.orderId && <InfoLine label="订单编号" value={log.orderId} />}
+                {log.shopName && <InfoLine label="店铺名" value={log.shopName} />}
+                {log.shopIncome != null && <InfoLine label="实收金额" value={`¥${Number(log.shopIncome).toFixed(2)}`} />}
               </div>
+              {log.isBug ? <ActionLink onClick={() => { setOrderDialog(log); setResolveSkuId(""); setResolveBrandId(""); setResolveProductId(""); }}>补全商品信息</ActionLink> : log.orderId ? <ActionLink onClick={() => setOrderDialog(log)}>关联订单</ActionLink> : null}
             </article>
           ))}
         </div>
@@ -2361,7 +2466,7 @@ function LogTable({
           </thead>
           <tbody>
             {logs.map((log) => (
-              <tr key={log.id}>
+              <tr key={log.id} className={log.isBug ? "bg-red-50" : undefined}>
                 <td className={tdBase}>{String(log.createdAt).replace("T", " ").slice(0, 19)}</td>
                 <td className={tdBase}><OperationTypeBadge value={log.operationType} /></td>
                 <td className={tdBase}>{log.brandName}</td>
@@ -2373,12 +2478,36 @@ function LogTable({
                 <td className={tdBase}>{log.quantity}</td>
                 <td className={tdBase}>{log.operatorName}</td>
                 <td className={tdBase}>{log.remark || "-"}</td>
-                <td className={actionTd}>{renderRevokeAction(log)}</td>
+                <td className={actionTd}>
+                  <div className="flex flex-wrap items-center gap-2">{renderRevokeAction(log)}{log.isBug ? <ActionLink onClick={() => { setOrderDialog(log); setResolveSkuId(""); setResolveBrandId(""); setResolveProductId(""); }}>补全商品信息</ActionLink> : log.orderId ? <ActionLink onClick={() => setOrderDialog(log)}>关联订单</ActionLink> : null}</div>
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
         </div>
+      {orderDialog && <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/40 p-3 sm:items-center sm:p-4">
+        <div className="w-full max-w-lg rounded-lg bg-white p-5 shadow-xl">
+          <div className="mb-4 flex items-center justify-between"><h3 className="text-lg font-semibold">{orderDialog.isBug ? "补全商品信息" : "关联订单"}</h3><Button variant="ghost" size="sm" onClick={() => setOrderDialog(null)}>关闭</Button></div>
+          <div className="grid gap-3">
+            <InfoLine label="订单编号" value={orderDialog.orderId || "-"} />
+            <InfoLine label="店铺名" value={orderDialog.shopName || "-"} />
+            <InfoLine label="实收金额" value={orderDialog.shopIncome == null ? "-" : `¥${Number(orderDialog.shopIncome).toFixed(2)}`} />
+            {!orderDialog.isBug && <>
+              <InfoLine label="品牌名" value={orderDialog.brandName || "-"} />
+              <InfoLine label="商品名" value={orderDialog.productName || "-"} />
+              <InfoLine label="规格名" value={orderDialog.skuName || "-"} />
+            </>}
+            {orderDialog.isBug && <>
+              <p className="rounded-md bg-red-50 p-2 text-sm text-red-700">原商品信息：{orderDialog.sourceProductText || "-"}</p>
+              <Field label="品牌名"><Select value={resolveBrandId} onChange={(event) => { setResolveBrandId(event.target.value); setResolveProductId(""); setResolveSkuId(""); }}><option value="">请选择品牌</option>{brandOptions.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}</Select></Field>
+              <Field label="商品名"><Select value={resolveProductId} disabled={!resolveBrandId} onChange={(event) => { setResolveProductId(event.target.value); setResolveSkuId(""); }}><option value="">请选择商品</option>{productOptions.filter((product) => product.brandId === Number(resolveBrandId)).map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</Select></Field>
+              <Field label="规格名"><Select value={resolveSkuId} disabled={!resolveProductId} onChange={(event) => setResolveSkuId(event.target.value)}><option value="">请选择规格</option>{catalogRows.filter((row) => row.brandId === Number(resolveBrandId) && row.productId === Number(resolveProductId)).map((row) => <option key={row.skuId} value={row.skuId}>{row.skuName}</option>)}</Select></Field>
+              <div className="flex justify-end"><Button disabled={!resolveSkuId} onClick={() => { onResolve(orderDialog, Number(resolveSkuId)); setOrderDialog(null); }}>确认补全并出库</Button></div>
+            </>}
+          </div>
+        </div>
+      </div>}
         <PaginationBar page={page} totalPages={totalPages} start={start} end={end} total={total} onPageChange={onPageChange} />
       </div>
     </section>
@@ -2771,7 +2900,7 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
                     <p className="text-sm text-slate-600">{log.skuName}</p>
                   </div>
                   <span className={["shrink-0 rounded-md px-2 py-1 text-sm font-semibold", Number(log.quantity) > 0 ? "bg-green-50 text-green-700" : "bg-red-50 text-red-700"].join(" ")}>
-                    {formatSigned(log.quantity)}
+                    <AbnormalQuantityText log={log} />
                   </span>
                 </div>
                 <div className="space-y-2">
@@ -2802,7 +2931,7 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
                     <td className={tdBase}>{log.brandName}</td>
                     <td className={tdBase}>{log.productName}</td>
                     <td className={tdBase}>{log.skuName}</td>
-                    <td className={[tdBase, Number(log.quantity) > 0 ? "font-semibold text-green-700" : "font-semibold text-red-700"].join(" ")}>{formatSigned(log.quantity)}</td>
+                    <td className={[tdBase, Number(log.quantity) > 0 ? "font-semibold text-green-700" : "font-semibold text-red-700"].join(" ")}><AbnormalQuantityText log={log} /></td>
                     <td className={tdBase}>{log.reason}</td>
                     <td className={tdBase}>{log.operatorName}</td>
                   </tr>
@@ -3021,12 +3150,13 @@ function formatMoney(value: number) {
   return `¥${Number(value || 0).toFixed(2)}`;
 }
 
-function PlatformAmountBreakdown({ amounts }: { amounts?: { douyin: number; pinduoduo: number; none: number } }) {
+function PlatformAmountBreakdown({ amounts }: { amounts?: { douyin: number; pinduoduo: number; kuaishou: number; none: number } }) {
   if (!amounts) return null;
   return (
     <div className="mt-1 space-y-0.5 text-xs font-normal text-slate-500">
       <div>拼多多：{formatMoney(amounts.pinduoduo || 0)}</div>
       <div>抖音：{formatMoney(amounts.douyin || 0)}</div>
+      <div>快手：{formatMoney(amounts.kuaishou || 0)}</div>
       {Number(amounts.none || 0) !== 0 && <div>未选择：{formatMoney(amounts.none || 0)}</div>}
     </div>
   );
@@ -3050,14 +3180,55 @@ type AmountRow = {
   skuName: string;
   quantity: number;
   amount: number;
+  salableQty?: number;
+  unsalableQty?: number;
+  salableAmount?: number;
+  unsalableAmount?: number;
   brandPlatformAmounts?: {
     douyin: number;
     pinduoduo: number;
+    kuaishou: number;
     none: number;
   };
 };
 
-function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown = false }: { rows: AmountRow[]; quantityTitle: string; amountTitle: string; showPlatformBreakdown?: boolean }) {
+function AmountDetailText({ children }: { children: React.ReactNode }) {
+  return <span className="ml-1 text-xs font-normal text-slate-500">{children}</span>;
+}
+
+function InventoryQuantityCell({ row }: { row: AmountRow }) {
+  const unsalableQty = Number(row.unsalableQty || 0);
+  return (
+    <span>
+      {row.quantity}
+      {unsalableQty > 0 && <AmountDetailText>（{Number(row.salableQty || 0)}可售；{unsalableQty}不可售）</AmountDetailText>}
+    </span>
+  );
+}
+
+function InventoryAmountCell({ amount, salableAmount, unsalableAmount }: { amount: number; salableAmount?: number; unsalableAmount?: number }) {
+  const unsalable = Number(unsalableAmount || 0);
+  return (
+    <span>
+      {formatMoney(amount)}
+      {unsalable > 0 && <AmountDetailText>（{formatMoney(Number(salableAmount || 0))}可售；{formatMoney(unsalable)}不可售）</AmountDetailText>}
+    </span>
+  );
+}
+
+function AmountTable({
+  rows,
+  quantityTitle,
+  amountTitle,
+  showPlatformBreakdown = false,
+  showInventoryBreakdown = false,
+}: {
+  rows: AmountRow[];
+  quantityTitle: string;
+  amountTitle: string;
+  showPlatformBreakdown?: boolean;
+  showInventoryBreakdown?: boolean;
+}) {
   const [expandedProducts, setExpandedProducts] = useState<Set<string>>(() => new Set());
   const productGroups = useMemo(() => {
     const groups = new Map<string, AmountRow[]>();
@@ -3090,8 +3261,18 @@ function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown =
     for (const row of rows) totals.set(row.brandId, (totals.get(row.brandId) || 0) + row.amount);
     return totals;
   }, [rows]);
+  const brandInventoryBreakdowns = useMemo(() => {
+    const totals = new Map<number, { salableAmount: number; unsalableAmount: number }>();
+    for (const row of rows) {
+      const current = totals.get(row.brandId) || { salableAmount: 0, unsalableAmount: 0 };
+      current.salableAmount += Number(row.salableAmount || 0);
+      current.unsalableAmount += Number(row.unsalableAmount || 0);
+      totals.set(row.brandId, current);
+    }
+    return totals;
+  }, [rows]);
   const brandPlatformAmounts = useMemo(() => {
-    const amounts = new Map<number, { douyin: number; pinduoduo: number; none: number }>();
+    const amounts = new Map<number, { douyin: number; pinduoduo: number; kuaishou: number; none: number }>();
     for (const row of rows) {
       if (row.brandPlatformAmounts && !amounts.has(row.brandId)) amounts.set(row.brandId, row.brandPlatformAmounts);
     }
@@ -3102,7 +3283,9 @@ function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown =
       brandId: number;
       brandName: string;
       totalAmount: number;
-      platformAmounts?: { douyin: number; pinduoduo: number; none: number };
+      salableAmount: number;
+      unsalableAmount: number;
+      platformAmounts?: { douyin: number; pinduoduo: number; kuaishou: number; none: number };
       products: typeof productGroups;
     }>();
 
@@ -3111,6 +3294,8 @@ function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown =
         brandId: group.brandId,
         brandName: group.brandName,
         totalAmount: brandTotals.get(group.brandId) || 0,
+        salableAmount: brandInventoryBreakdowns.get(group.brandId)?.salableAmount || 0,
+        unsalableAmount: brandInventoryBreakdowns.get(group.brandId)?.unsalableAmount || 0,
         platformAmounts: brandPlatformAmounts.get(group.brandId),
         products: [],
       };
@@ -3119,7 +3304,7 @@ function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown =
     }
 
     return [...groups.values()];
-  }, [pageGroups, brandTotals, brandPlatformAmounts, productGroups]);
+  }, [pageGroups, brandTotals, brandInventoryBreakdowns, brandPlatformAmounts, productGroups]);
   const visibleBrandSpan = (startIndex: number) => {
     const brandId = pageGroups[startIndex]?.brandId;
     let span = 0;
@@ -3148,7 +3333,12 @@ function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown =
                 {showPlatformBreakdown && <PlatformAmountBreakdown amounts={brand.platformAmounts} />}
               </div>
               <span className="shrink-0 rounded-md bg-blue-50 px-2 py-1 text-sm font-semibold text-blue-700">
-                {formatMoney(brand.totalAmount)}
+                <span className="block">{formatMoney(brand.totalAmount)}</span>
+                {showInventoryBreakdown && brand.unsalableAmount > 0 && (
+                  <span className="mt-0.5 block text-xs font-normal text-slate-500">
+                    （{formatMoney(brand.salableAmount)}可售；{formatMoney(brand.unsalableAmount)}不可售）
+                  </span>
+                )}
               </span>
             </div>
             <div className="divide-y divide-slate-100">
@@ -3182,8 +3372,14 @@ function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown =
                           {product.rows.map((row) => (
                             <tr key={row.skuId}>
                               <td className="break-words border border-slate-200 px-2 py-1.5">{row.skuName}</td>
-                              <td className="border border-slate-200 px-2 py-1.5">{row.quantity}</td>
-                              <td className="border border-slate-200 px-2 py-1.5">{formatMoney(row.amount)}</td>
+                              <td className="border border-slate-200 px-2 py-1.5">
+                                {showInventoryBreakdown ? <InventoryQuantityCell row={row} /> : row.quantity}
+                              </td>
+                              <td className="border border-slate-200 px-2 py-1.5">
+                                {showInventoryBreakdown ? (
+                                  <InventoryAmountCell amount={row.amount} salableAmount={row.salableAmount} unsalableAmount={row.unsalableAmount} />
+                                ) : formatMoney(row.amount)}
+                              </td>
                             </tr>
                           ))}
                         </tbody>
@@ -3229,6 +3425,11 @@ function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown =
                   {brandSpan > 0 && (
                     <td className={tdBase} rowSpan={brandSpan}>
                       <div>{formatMoney(brandTotals.get(group.brandId) || 0)}</div>
+                      {showInventoryBreakdown && Number(brandInventoryBreakdowns.get(group.brandId)?.unsalableAmount || 0) > 0 && (
+                        <div className="mt-1 text-xs font-normal text-slate-500">
+                          （{formatMoney(Number(brandInventoryBreakdowns.get(group.brandId)?.salableAmount || 0))}可售；{formatMoney(Number(brandInventoryBreakdowns.get(group.brandId)?.unsalableAmount || 0))}不可售）
+                        </div>
+                      )}
                       {showPlatformBreakdown && <PlatformAmountBreakdown amounts={brandPlatformAmounts.get(group.brandId)} />}
                     </td>
                   )}
@@ -3248,8 +3449,14 @@ function AmountTable({ rows, quantityTitle, amountTitle, showPlatformBreakdown =
                           {group.rows.map((row) => (
                             <tr key={row.skuId}>
                               <td className="border border-slate-200 bg-white px-3 py-2">{row.skuName}</td>
-                              <td className="border border-slate-200 bg-white px-3 py-2">{row.quantity}</td>
-                              <td className="border border-slate-200 bg-white px-3 py-2">{formatMoney(row.amount)}</td>
+                              <td className="border border-slate-200 bg-white px-3 py-2">
+                                {showInventoryBreakdown ? <InventoryQuantityCell row={row} /> : row.quantity}
+                              </td>
+                              <td className="border border-slate-200 bg-white px-3 py-2">
+                                {showInventoryBreakdown ? (
+                                  <InventoryAmountCell amount={row.amount} salableAmount={row.salableAmount} unsalableAmount={row.unsalableAmount} />
+                                ) : formatMoney(row.amount)}
+                              </td>
                             </tr>
                           ))}
                         </tbody>
@@ -3274,7 +3481,10 @@ function InventoryAmountPage({ rows, token }: { rows: SkuInventoryRow[]; token: 
   const amountRows = useMemo<AmountRow[]>(
     () =>
       rows.map((row) => {
-        const quantity = Number(row.salableQty) + Number(row.unsalableQty);
+        const salableQty = Number(row.salableQty);
+        const unsalableQty = Number(row.unsalableQty);
+        const purchasePrice = Number(row.purchasePrice);
+        const quantity = salableQty + unsalableQty;
         return {
           brandId: row.brandId,
           brandName: row.brandName,
@@ -3283,7 +3493,11 @@ function InventoryAmountPage({ rows, token }: { rows: SkuInventoryRow[]; token: 
           skuId: row.skuId,
           skuName: row.skuName,
           quantity,
-          amount: quantity * Number(row.purchasePrice),
+          amount: quantity * purchasePrice,
+          salableQty,
+          unsalableQty,
+          salableAmount: salableQty * purchasePrice,
+          unsalableAmount: unsalableQty * purchasePrice,
         };
       }),
     [rows],
@@ -3325,7 +3539,7 @@ function InventoryAmountPage({ rows, token }: { rows: SkuInventoryRow[]; token: 
         </div>
       </div>
       {error && <p className="m-5 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
-      <AmountTable rows={amountRows} quantityTitle="库存总量" amountTitle="库存金额" />
+      <AmountTable rows={amountRows} quantityTitle="库存总量" amountTitle="库存金额" showInventoryBreakdown />
     </section>
   );
 }
@@ -3361,6 +3575,7 @@ function SalesAmountPage({ token }: { token: string }) {
             ? {
                 douyin: Number(row.brandPlatformAmounts.douyin || 0),
                 pinduoduo: Number(row.brandPlatformAmounts.pinduoduo || 0),
+                kuaishou: Number(row.brandPlatformAmounts.kuaishou || 0),
                 none: Number(row.brandPlatformAmounts.none || 0),
               }
             : undefined,
@@ -3455,6 +3670,7 @@ function DefaultPlatformPicker({ value, onChange }: { value: string; onChange: (
   const options = [
     { value: "pinduoduo", label: "拼多多" },
     { value: "douyin", label: "抖音" },
+    { value: "kuaishou", label: "快手" },
   ];
 
   return (
@@ -3505,10 +3721,17 @@ function EditorDialog({
   const activeBrands = brands.filter((brand) => !brand.isHidden);
   const productOptions = (modalProducts.length ? modalProducts : products.filter((product) => product.brandId === Number(form.brandId))).filter((product) => !product.isHidden);
   const skuOptions = (modalSkus.length ? modalSkus : []).filter((sku) => !sku.isHidden);
+  const updateRow = (index: number, key: string, value: unknown) => {
+    const rows = Array.isArray(form.rows) ? [...form.rows] : [];
+    rows[index] = { ...rows[index], [key]: value };
+    onChange("rows", rows);
+  };
+  const addRow = (row: Record<string, unknown>) => onChange("rows", [...(Array.isArray(form.rows) ? form.rows : []), row]);
+  const removeRow = (index: number) => onChange("rows", form.rows.filter((_: unknown, rowIndex: number) => rowIndex !== index));
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-950/40 p-3 sm:items-center sm:p-4">
-      <form onSubmit={onSubmit} className="max-h-[calc(100vh-1.5rem)] w-full max-w-xl overflow-y-auto rounded-lg bg-white p-4 shadow-xl sm:max-h-[calc(100vh-2rem)] sm:p-5">
+      <form onSubmit={onSubmit} className={`max-h-[calc(100vh-1.5rem)] w-full ${dialog === "inbound" || dialog === "outbound" ? "max-w-6xl" : dialog === "sku" && !editingId ? "max-w-4xl" : "max-w-xl"} overflow-y-auto rounded-lg bg-white p-4 shadow-xl sm:max-h-[calc(100vh-2rem)] sm:p-5`}>
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-lg font-semibold">{dialog === "inbound" ? "入库" : dialog === "outbound" ? "出库" : dialog === "abnormal" ? "异常库存" : editingId ? "修改" : "新增"}</h3>
           <Button variant="ghost" size="sm" onClick={onClose}>关闭</Button>
@@ -3548,9 +3771,32 @@ function EditorDialog({
             <>
               <Field label="品牌名"><Select value={String(form.brandId || "")} onChange={(event) => void onBrandChange(Number(event.target.value))} required>{activeBrands.map((brand) => <option key={brand.id} value={brand.id}>{brand.name}</option>)}</Select></Field>
               <Field label="商品名"><Select value={String(form.productId || "")} onChange={(event) => void onProductChange(Number(event.target.value))} required>{productOptions.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</Select></Field>
-              <Field label="规格名"><Input value={form.name || ""} onChange={(event) => onChange("name", event.target.value)} required maxLength={15} /></Field>
-              <Field label="购入价格"><Input type="number" min="0" step="0.01" value={form.purchasePrice || ""} onChange={(event) => onChange("purchasePrice", event.target.value)} required /></Field>
-              <Field label="备注"><Input value={form.remark || ""} onChange={(event) => onChange("remark", event.target.value)} /></Field>
+              {editingId ? (
+                <>
+                  <Field label="规格名"><Input value={form.name || ""} onChange={(event) => onChange("name", event.target.value)} required maxLength={15} /></Field>
+                  <Field label="购入价格"><Input type="number" min="0" step="0.01" value={form.purchasePrice || ""} onChange={(event) => onChange("purchasePrice", event.target.value)} required /></Field>
+                  <Field label="备注"><Input value={form.remark || ""} onChange={(event) => onChange("remark", event.target.value)} /></Field>
+                </>
+              ) : (
+                <Field label="规格行">
+                  <div className="space-y-2">
+                    <div className="hidden grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_5rem] gap-2 px-1 text-xs text-slate-500 sm:grid">
+                      <span>规格名</span><span>购入价格</span><span>备注</span><span />
+                    </div>
+                    {(form.rows || []).map((row: Record<string, any>, index: number) => (
+                      <div key={index} className="grid grid-cols-2 gap-2 rounded-md border border-slate-200 p-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_5rem] sm:items-center sm:border-0 sm:p-0">
+                        <Input className="min-w-0" placeholder="规格名" aria-label="规格名" value={row.name || ""} onChange={(event) => updateRow(index, "name", event.target.value)} required maxLength={15} />
+                        <Input className="min-w-0" type="number" min="0" step="0.01" placeholder="购入价格" aria-label="购入价格" value={row.purchasePrice ?? ""} onChange={(event) => updateRow(index, "purchasePrice", event.target.value)} required />
+                        <Input className="col-span-2 min-w-0 sm:col-span-1" placeholder="备注" aria-label="备注" value={row.remark || ""} onChange={(event) => updateRow(index, "remark", event.target.value)} />
+                        <div className="col-span-2 flex justify-end gap-1 sm:col-span-1">
+                          {form.rows.length > 1 && <Button type="button" variant="ghost" size="sm" aria-label="删除此行" onClick={() => removeRow(index)}><X className="h-4 w-4" /></Button>}
+                          {index === form.rows.length - 1 && <Button type="button" variant="secondary" size="sm" aria-label="新增一行" onClick={() => addRow({ name: "", purchasePrice: "", remark: "" })}><Plus className="h-4 w-4" /></Button>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </Field>
+              )}
             </>
           )}
           {(dialog === "inbound" || dialog === "outbound" || dialog === "abnormal") && (
@@ -3574,7 +3820,39 @@ function EditorDialog({
                   {productOptions.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
                 </Select>
               </Field>
-              <Field label="规格名">
+              {(dialog === "inbound" || dialog === "outbound") ? (
+                <Field label="规格行">
+                  <div className="space-y-2">
+                    <div className={`hidden gap-2 px-1 text-xs text-slate-500 sm:grid ${dialog === "inbound" ? "sm:grid-cols-[minmax(0,1.5fr)_5rem_6.5rem_6.5rem_7rem_minmax(7rem,1fr)_5rem]" : "sm:grid-cols-[minmax(0,1.35fr)_4.5rem_6.5rem_minmax(7rem,1fr)_6.5rem_minmax(7rem,1fr)_5rem]"}`}>
+                      <span>规格名</span><span>数量</span>{dialog === "inbound" && <><span>类型</span><span>标签</span></>}<span>平台</span>{dialog === "outbound" && <><span>订单编号</span><span>实收金额</span></>}<span>备注</span><span />
+                    </div>
+                    {(form.rows || []).map((row: Record<string, any>, index: number) => (
+                      <div key={index} className={`grid grid-cols-2 gap-2 rounded-md border border-slate-200 p-2 sm:items-center sm:border-0 sm:p-0 ${dialog === "inbound" ? "sm:grid-cols-[minmax(0,1.5fr)_5rem_6.5rem_6.5rem_7rem_minmax(7rem,1fr)_5rem]" : "sm:grid-cols-[minmax(0,1.35fr)_4.5rem_6.5rem_minmax(7rem,1fr)_6.5rem_minmax(7rem,1fr)_5rem]"}`}>
+                        <Select aria-label="规格名" className="col-span-2 min-w-0 sm:col-span-1" value={String(row.skuId || "")} onChange={(event) => updateRow(index, "skuId", event.target.value ? Number(event.target.value) : "")} required>
+                          <option value="">请选择规格</option>{skuOptions.map((sku) => <option key={sku.id} value={sku.id}>{sku.name}</option>)}
+                        </Select>
+                        <Input aria-label="数量" type="number" min="1" step="1" value={row.quantity ?? 1} onChange={(event) => updateRow(index, "quantity", event.target.value)} required />
+                        {dialog === "inbound" && <>
+                          <Select aria-label="入库类型" value={row.inboundType || "new"} onChange={(event) => updateRow(index, "inboundType", event.target.value)}><option value="new">新货</option><option value="return">退货</option></Select>
+                          <Select aria-label="标签" value={row.label || "salable"} onChange={(event) => updateRow(index, "label", event.target.value)}><option value="salable">可售</option><option value="unsalable">不可售</option></Select>
+                        </>}
+                        <Select aria-label="平台" value={row.platform || ""} onChange={(event) => updateRow(index, "platform", event.target.value)}>
+                          <option value="">平台</option><option value="douyin">抖音</option><option value="pinduoduo">拼多多</option><option value="kuaishou">快手</option>
+                        </Select>
+                        {dialog === "outbound" && <>
+                          <Input aria-label="订单编号" placeholder="订单编号" value={row.orderId || ""} onChange={(event) => updateRow(index, "orderId", event.target.value)} />
+                          <Input aria-label="实收金额" placeholder="实收金额" type="number" min="0" step="0.01" value={row.shopIncome || ""} onChange={(event) => updateRow(index, "shopIncome", event.target.value)} />
+                        </>}
+                        <Input aria-label="备注" placeholder="备注" value={row.remark || ""} onChange={(event) => updateRow(index, "remark", event.target.value)} />
+                        <div className="col-span-2 flex justify-end gap-1 sm:col-span-1">
+                          {form.rows.length > 1 && <Button type="button" variant="ghost" size="sm" aria-label="删除此行" onClick={() => removeRow(index)}><X className="h-4 w-4" /></Button>}
+                          {index === form.rows.length - 1 && <Button type="button" variant="secondary" size="sm" aria-label="新增一行" onClick={() => addRow({ skuId: "", quantity: 1, platform: row.platform || "", orderId: "", shopIncome: "", remark: "", inboundType: "new", label: "salable" })}><Plus className="h-4 w-4" /></Button>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </Field>
+              ) : <Field label="规格名">
                 <Select
                   value={String(form.skuId || "")}
                   className={!form.skuId ? "text-slate-400 [&>option]:text-slate-800" : "[&>option]:text-slate-800"}
@@ -3584,31 +3862,33 @@ function EditorDialog({
                   <option value="">请选择规格</option>
                   {skuOptions.map((sku) => <option key={sku.id} value={sku.id}>{sku.name}</option>)}
                 </Select>
-              </Field>
-              <Field label="数量">
+              </Field>}
+              {dialog === "abnormal" && <Field label="数量">
                 <div className="space-y-1">
                   <Input type="number" min={dialog === "abnormal" ? undefined : "1"} step="1" value={form.quantity || 1} onChange={(event) => onChange("quantity", event.target.value)} required />
-                  {(dialog === "outbound" || dialog === "abnormal") && currentStock !== null && (
+                  {currentStock !== null && (
                     <p className="text-xs font-medium text-red-600">
                       当前库存数：{currentStock.salableQty}
                     </p>
                   )}
                 </div>
-              </Field>
-              {dialog === "inbound" && <Field label="类型"><Select value={form.inboundType || "new"} onChange={(event) => onChange("inboundType", event.target.value)}><option value="new">新货</option><option value="return">退货</option></Select></Field>}
-              {(dialog === "inbound" || dialog === "outbound") && <Field label="平台">
-                <Select value={form.platform || ""} onChange={(event) => onChange("platform", event.target.value)}>
-                  <option value=""></option>
-                  <option value="douyin">抖音</option>
-                  <option value="pinduoduo">拼多多</option>
-                </Select>
-              </Field>}
-              {dialog === "inbound" && <Field label="标签">
-                <StockLabelPicker value={form.label || "salable"} onChange={(value) => onChange("label", value)}>
-                </StockLabelPicker>
               </Field>}
               {dialog === "abnormal" ? (
-                <Field label="原因"><Input value={form.reason || ""} onChange={(event) => onChange("reason", event.target.value)} required /></Field>
+                <>
+                  {Number(form.quantity) < 0 && (
+                    <Field label="">
+                      <label className="inline-flex items-center gap-2 text-sm text-slate-700">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(form.addToUnsalable)}
+                          onChange={(event) => onChange("addToUnsalable", event.target.checked)}
+                        />
+                        加入不可售
+                      </label>
+                    </Field>
+                  )}
+                  <Field label="原因"><Input value={form.reason || ""} onChange={(event) => onChange("reason", event.target.value)} required /></Field>
+                </>
               ) : (
                 <Field label="备注"><Input value={form.remark || ""} onChange={(event) => onChange("remark", event.target.value)} /></Field>
               )}
@@ -3687,9 +3967,19 @@ function StockLabelText({ value }: { value: number }) {
   return <span className={isUnsalable ? "font-medium text-red-600" : undefined}>{isUnsalable ? "不可售" : "可售"}</span>;
 }
 
+function AbnormalQuantityText({ log }: { log: InventoryAbnormalLog }) {
+  return (
+    <>
+      {formatSigned(log.quantity)}
+      {Number(log.stockLabel) === 2 && <span className="ml-1 font-normal text-slate-500">（不可售）</span>}
+    </>
+  );
+}
+
 function platformLabel(value?: string) {
   if (value === "douyin") return "抖音";
   if (value === "pinduoduo") return "拼多多";
+  if (value === "kuaishou") return "快手";
   return "";
 }
 

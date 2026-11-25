@@ -25,7 +25,10 @@ const inventoryCheckUploadDir = path.join(projectRoot, "uploads", "inventory-che
 const permissionCodeByName = { SUPER: 1, INVENTORY: 2, FINANCE: 3 };
 const permissionNameByCode = { 1: "SUPER", 2: "INVENTORY", 3: "FINANCE" };
 
-app.use(cors({ origin: process.env.CORS_ORIGIN || "http://127.0.0.1:5173" }));
+app.use(cors({ origin(origin, callback) {
+  const allowed = process.env.CORS_ORIGIN || "http://127.0.0.1:5173";
+  callback(null, !origin || origin === allowed || /^chrome-extension:\/\/[a-z]{32}$/.test(origin));
+} }));
 app.use(express.json({ limit: "1mb" }));
 
 await ensureSchema();
@@ -33,10 +36,16 @@ await ensureSchema();
 async function ensureSchema() {
   await query("alter table users modify column email varchar(128) null comment 'optional notification email'");
   await query("alter table brands add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
-  await query("alter table brands add column if not exists default_platform tinyint unsigned null comment '默认平台：1抖音，2拼多多，为空表示未选择' after remark");
+  await query("alter table brands add column if not exists default_platform tinyint unsigned null comment '默认平台：1抖音，2拼多多，3快手，为空表示未选择' after remark");
   await query("alter table products add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
   await query("alter table skus add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
-  await query("alter table inventory_operation_logs add column if not exists platform tinyint unsigned null comment '平台：1抖音，2拼多多，为空表示未选择' after stock_label");
+  await query("alter table inventory_operation_logs add column if not exists platform tinyint unsigned null comment '平台：1抖音，2拼多多，3快手，为空表示未选择' after stock_label");
+  await query("alter table inventory_operation_logs modify column sku_id bigint unsigned null comment 'SKU ID；打单匹配失败时为空'");
+  await query("alter table inventory_operation_logs add column if not exists order_id varchar(64) null comment '订单编号'");
+  await query("alter table inventory_operation_logs add column if not exists shop_name varchar(128) null comment '店铺名'");
+  await query("alter table inventory_operation_logs add column if not exists shop_income decimal(12,2) null comment '实收金额'");
+  await query("alter table inventory_operation_logs add column if not exists is_bug tinyint unsigned not null default 0 comment '商品匹配异常标记'");
+  await query("alter table inventory_operation_logs add column if not exists source_product_text varchar(1000) null comment '打单商品原始文本'");
   await query(`create table if not exists inventory_checks (
     id bigint unsigned not null auto_increment comment '盘点记录ID',
     check_time datetime not null default current_timestamp comment '盘点时间',
@@ -117,6 +126,18 @@ async function ensureSchema() {
     constraint fk_user_brand_subscriptions_user foreign key (user_id) references users (id) on delete cascade,
     constraint fk_user_brand_subscriptions_brand foreign key (brand_id) references brands (id) on delete cascade
   ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='user subscribed brands'`);
+  await query("alter table brands modify column default_platform tinyint unsigned null comment 'default platform: 1 douyin, 2 pinduoduo, 3 kuaishou, null none'");
+  await query("alter table inventory_operation_logs modify column platform tinyint unsigned null comment 'platform: 1 douyin, 2 pinduoduo, 3 kuaishou, null none'");
+  try {
+    await query("alter table inventory_operation_logs drop constraint chk_inventory_logs_platform");
+  } catch (error) {
+    if (!["ER_CANT_DROP_FIELD_OR_KEY", "ER_CHECK_CONSTRAINT_NOT_FOUND"].includes(error.code)) throw error;
+  }
+  try {
+    await query("alter table inventory_operation_logs add constraint chk_inventory_logs_platform check (platform is null or platform in (1, 2, 3))");
+  } catch (error) {
+    if (error.code !== "ER_DUP_CHECK_CONSTRAINT_NAME") throw error;
+  }
 }
 
 function badRequest(message) {
@@ -163,6 +184,7 @@ function normalizePermissions(permissions) {
 function normalizePlatform(value) {
   if (value === "douyin") return 1;
   if (value === "pinduoduo") return 2;
+  if (value === "kuaishou") return 3;
   return null;
 }
 
@@ -445,7 +467,7 @@ app.get("/api/brands", requireAuth, readScope, async (req, res, next) => {
     res.json(
       await query(
         `select id, name, remark,
-          case default_platform when 1 then 'douyin' when 2 then 'pinduoduo' else '' end as defaultPlatform,
+          case default_platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else '' end as defaultPlatform,
           sort_order as sortOrder, is_hidden as isHidden
          from brands
          where deleted_at is null and (? = 1 or is_hidden = 0)
@@ -630,6 +652,33 @@ app.post("/api/skus", requireAuth, requireSuper, async (req, res, next) => {
   }
 });
 
+app.post("/api/skus/batch", requireAuth, requireSuper, async (req, res, next) => {
+  try {
+    const productId = Number(req.body.productId);
+    const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+    if (!Number.isInteger(productId) || productId <= 0) throw badRequest("商品不合法");
+    if (!rows.length) throw badRequest("请至少填写一行规格信息");
+    const created = await withTransaction(async (connection) => {
+      const [productRows] = await connection.execute("select id from products where id = ? and deleted_at is null", [productId]);
+      if (!productRows[0]) throw badRequest("商品不存在");
+      const [sortRows] = await connection.execute("select coalesce(max(sort_order), 0) + 10 as maxSort from skus where product_id = ?", [productId]);
+      const ids = [];
+      for (const [index, row] of rows.entries()) {
+        const [result] = await connection.execute(
+          "insert into skus(product_id, name, purchase_price, remark, sort_order) values(?, ?, ?, ?, ?)",
+          [productId, assertName(row.name, "规格名"), toNumber(row.purchasePrice, "购入价格"), String(row.remark || "").trim(), Number(sortRows[0].maxSort) + index * 10],
+        );
+        await connection.execute("insert into sku_inventory(sku_id, salable_qty, unsalable_qty) values(?, 0, 0)", [result.insertId]);
+        ids.push(result.insertId);
+      }
+      return ids;
+    });
+    res.status(201).json({ ids: created });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.put("/api/skus/:id", requireAuth, requireSuper, async (req, res, next) => {
   try {
     await query("update skus set product_id = ?, name = ?, purchase_price = ?, remark = ? where id = ?", [
@@ -744,39 +793,41 @@ app.get("/api/inventory/products", requireAuth, readScope, async (_req, res, nex
   }
 });
 
-async function writeInventoryOperation(req, mode) {
-  const skuId = Number(req.body.skuId);
-  const quantity = toPositiveInteger(req.body.quantity, "数量");
-  const label = req.body.label === "unsalable" ? "unsalable" : "salable";
+async function applyInventoryOperation(connection, req, mode, body) {
+  const skuId = Number(body.skuId);
+  const quantity = toPositiveInteger(body.quantity, "数量");
+  const label = body.label === "unsalable" ? "unsalable" : "salable";
   const labelCode = label === "salable" ? 1 : 2;
-  const inboundType = req.body.inboundType === "new" ? 1 : 2;
-  const platform = normalizePlatform(req.body.platform);
-  const simultaneousInbound = Boolean(req.body.simultaneousInbound);
+  const inboundType = body.inboundType === "new" ? 1 : 2;
+  const platform = normalizePlatform(body.platform);
+  const simultaneousInbound = Boolean(body.simultaneousInbound);
   const operationType = mode === "in" ? 1 : 2;
-  return withTransaction(async (connection) => {
-    const [stockRows] = await connection.execute("select salable_qty, unsalable_qty from sku_inventory where sku_id = ? for update", [skuId]);
-    const stock = stockRows[0];
-    if (!stock) throw badRequest("规格库存不存在");
-    let salable = Number(stock.salable_qty);
-    let unsalable = Number(stock.unsalable_qty);
-    if (mode === "in") {
-      if (label === "salable") salable += quantity;
-      else unsalable += quantity;
-    } else if (label === "salable") {
-      salable -= quantity;
-    } else {
-      unsalable -= quantity;
-      if (simultaneousInbound) salable += quantity;
-    }
-    await connection.execute("update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?", [salable, unsalable, skuId]);
-    const [created] = await connection.execute(
-      `insert into inventory_operation_logs
-        (sku_id, operation_type, inbound_type, stock_label, platform, quantity, simultaneous_inbound, remark, operator_user_id)
-       values(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [skuId, operationType, mode === "in" ? inboundType : null, labelCode, platform, quantity, mode === "out" && label === "unsalable" && simultaneousInbound ? 1 : 0, String(req.body.remark || "").trim(), req.user.id],
-    );
-    return { id: created.insertId, salableQty: salable, unsalableQty: unsalable };
-  });
+  const [stockRows] = await connection.execute("select salable_qty, unsalable_qty from sku_inventory where sku_id = ? for update", [skuId]);
+  const stock = stockRows[0];
+  if (!stock) throw badRequest("规格库存不存在");
+  let salable = Number(stock.salable_qty);
+  let unsalable = Number(stock.unsalable_qty);
+  if (mode === "in") {
+    if (label === "salable") salable += quantity;
+    else unsalable += quantity;
+  } else if (label === "salable") {
+    salable -= quantity;
+  } else {
+    unsalable -= quantity;
+    if (simultaneousInbound) salable += quantity;
+  }
+  await connection.execute("update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?", [salable, unsalable, skuId]);
+  const [created] = await connection.execute(
+    `insert into inventory_operation_logs
+      (sku_id, operation_type, inbound_type, stock_label, platform, quantity, simultaneous_inbound, remark, order_id, shop_name, shop_income, is_bug, source_product_text, operator_user_id)
+     values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [skuId, operationType, mode === "in" ? inboundType : null, labelCode, platform, quantity, mode === "out" && label === "unsalable" && simultaneousInbound ? 1 : 0, String(body.remark || "").trim(), body.orderId || null, body.shopName || null, body.shopIncome == null || body.shopIncome === "" ? null : Number(body.shopIncome), body.isBug ? 1 : 0, body.sourceProductText || null, req.user.id],
+  );
+  return { id: created.insertId, salableQty: salable, unsalableQty: unsalable };
+}
+
+async function writeInventoryOperation(req, mode) {
+  return withTransaction((connection) => applyInventoryOperation(connection, req, mode, req.body));
 }
 
 app.post("/api/inventory/inbound", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
@@ -795,11 +846,124 @@ app.post("/api/inventory/outbound", requireAuth, requireAnyPermission(["INVENTOR
   }
 });
 
+app.post("/api/inventory/operations/batch", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
+  try {
+    const mode = req.body.mode === "in" ? "in" : req.body.mode === "out" ? "out" : null;
+    const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+    if (!mode) throw badRequest("操作类型不合法");
+    if (!rows.length) throw badRequest("请至少填写一行操作");
+    const results = await withTransaction(async (connection) => {
+      const applied = [];
+      for (const row of rows) applied.push(await applyInventoryOperation(connection, req, mode, row));
+      return applied;
+    });
+    res.status(201).json({ results });
+  } catch (error) {
+    next(error);
+  }
+});
+
+function normalizeProductMatch(value) {
+  return String(value || "").toLowerCase()
+    .replace(/超轻超硬|超轻|轻量|小综合|综合竿|超硬|野钓|黑坑|碳素|鱼竿|钓竿|台钓|鲫鲤|全新正品|防伪可查|假一赔十|不支持下水试用/g, "")
+    .replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function normalizeSkuMatch(value) {
+  return String(value || "").toLowerCase().replace(/\s+/g, "").replace(/米|厘米|cm|mm|m/g, "").replace(/[^a-z0-9.]/g, "");
+}
+
+function findMatchingSku(skus, productText) {
+  const normalizedText = normalizeSkuMatch(productText);
+  const sorted = [...skus].sort((a, b) => normalizeSkuMatch(b.name).length - normalizeSkuMatch(a.name).length);
+  return sorted.find((row) => {
+    const name = normalizeSkuMatch(row.name);
+    if (!name) return false;
+    if (/[a-z]/.test(name)) return normalizedText.includes(name);
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|[^0-9.])${escaped}(?=$|[^0-9.])`).test(normalizedText);
+  }) || null;
+}
+
+app.post("/api/inventory/orders/sync", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
+  try {
+    const platform = normalizePlatform(req.body.platform);
+    const orders = Array.isArray(req.body.orders) ? req.body.orders : [];
+    if (!platform) throw badRequest("平台不合法");
+    if (!orders.length || orders.length > 500) throw badRequest("订单明细数量不合法");
+    const results = await withTransaction(async (connection) => {
+      const [brands] = await connection.execute("select id, name from brands where deleted_at is null and is_hidden = 0 order by sort_order, id");
+      const created = [];
+      for (const item of orders) {
+        const text = String(item.productText || "").trim();
+        const quantity = toPositiveInteger(item.quantity, "数量");
+        if (!String(item.orderId || "").trim()) throw badRequest("订单编号不能为空");
+        const brand = [...brands].sort((a, b) => b.name.length - a.name.length).find((row) => text.includes(row.name));
+        let product = null;
+        let sku = null;
+        if (brand) {
+          const [products] = await connection.execute("select id, name from products where brand_id=? and deleted_at is null and is_hidden=0 order by sort_order,id", [brand.id]);
+          const normalizedText = normalizeProductMatch(text);
+          product = [...products]
+            .map((row) => ({ ...row, matchName: normalizeProductMatch(row.name) }))
+            .filter((row) => row.matchName && normalizedText.includes(row.matchName))
+            .sort((a, b) => b.matchName.length - a.matchName.length)[0] || null;
+          if (product) {
+            const [skus] = await connection.execute("select id, name from skus where product_id=? and deleted_at is null and is_hidden=0 order by sort_order,id", [product.id]);
+            sku = findMatchingSku(skus, text);
+          }
+        }
+        const orderMeta = {
+          orderId: String(item.orderId).slice(0, 64), shopName: String(item.shopName || "").slice(0, 128),
+          shopIncome: item.shopIncome, sourceProductText: text,
+        };
+        if (sku) {
+          created.push(await applyInventoryOperation(connection, req, "out", {
+            skuId: sku.id, quantity, platform: req.body.platform, label: "salable",
+            remark: "拼多多打单同步", ...orderMeta,
+          }));
+        } else {
+          const income = orderMeta.shopIncome == null || orderMeta.shopIncome === "" ? null : Number(orderMeta.shopIncome);
+          const [log] = await connection.execute(
+            `insert into inventory_operation_logs (sku_id,operation_type,inbound_type,stock_label,platform,quantity,remark,order_id,shop_name,shop_income,is_bug,source_product_text,operator_user_id)
+             values(null,2,null,1,?,?,'拼多多打单同步',?,?,?,?,?,?)`,
+            [platform, quantity, orderMeta.orderId, orderMeta.shopName, income, 1, text, req.user.id],
+          );
+          created.push({ id: log.insertId, isBug: true });
+        }
+      }
+      return created;
+    });
+    res.status(201).json({ results });
+  } catch (error) { next(error); }
+});
+
+app.patch("/api/inventory/orders/:id/resolve", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const skuId = Number(req.body.skuId);
+    if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(skuId) || skuId <= 0) throw badRequest("订单或规格不合法");
+    await withTransaction(async (connection) => {
+      const [logs] = await connection.execute("select * from inventory_operation_logs where id=? and is_bug=1 for update", [id]);
+      const log = logs[0];
+      if (!log) throw badRequest("异常订单不存在或已补全");
+      const [stocks] = await connection.execute("select salable_qty from sku_inventory where sku_id=? for update", [skuId]);
+      if (!stocks[0]) throw badRequest("规格库存不存在");
+      const qty = Number(stocks[0].salable_qty) - Number(log.quantity);
+      if (qty < 0) throw badRequest("可售库存不足，无法完成出库");
+      await connection.execute("update sku_inventory set salable_qty=? where sku_id=?", [qty, skuId]);
+      await connection.execute("update inventory_operation_logs set sku_id=?,is_bug=0 where id=?", [skuId, id]);
+    });
+    res.json({ ok: true });
+  } catch (error) { next(error); }
+});
+
 app.post("/api/inventory/abnormal", requireAuth, requireAnyPermission(["INVENTORY"]), async (req, res, next) => {
   try {
     const skuId = Number(req.body.skuId);
     if (!Number.isInteger(skuId) || skuId <= 0) throw badRequest("规格不合法");
     const quantity = toNonZeroInteger(req.body.quantity, "数量");
+    const addToUnsalable = quantity < 0 && Boolean(req.body.addToUnsalable);
     const reason = String(req.body.reason || "").trim();
     if (!reason) throw badRequest("原因不能为空");
     if (reason.length > 255) throw badRequest("原因不能超过255个字符");
@@ -809,13 +973,20 @@ app.post("/api/inventory/abnormal", requireAuth, requireAnyPermission(["INVENTOR
       const stock = stockRows[0];
       if (!stock) throw badRequest("规格库存不存在");
       const salable = Number(stock.salable_qty) + quantity;
-      const unsalable = Number(stock.unsalable_qty);
-      await connection.execute("update sku_inventory set salable_qty = ? where sku_id = ?", [salable, skuId]);
+      const unsalable = Number(stock.unsalable_qty) + (addToUnsalable ? Math.abs(quantity) : 0);
+      await connection.execute("update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?", [salable, unsalable, skuId]);
       const [created] = await connection.execute(
         `insert into inventory_abnormal_logs (sku_id, stock_label, quantity, reason, operator_user_id)
          values(?, 1, ?, ?, ?)`,
         [skuId, quantity, reason, req.user.id],
       );
+      if (addToUnsalable) {
+        await connection.execute(
+          `insert into inventory_abnormal_logs (sku_id, stock_label, quantity, reason, operator_user_id)
+           values(?, 2, ?, ?, ?)`,
+          [skuId, Math.abs(quantity), reason, req.user.id],
+        );
+      }
       return { id: created.insertId, skuId, quantity, salableQty: salable, unsalableQty: unsalable };
     });
 
@@ -843,27 +1014,28 @@ app.delete("/api/inventory/logs/:id", requireAuth, requireAnyPermission(["INVENT
       if (!log) throw badRequest("库存操作记录不存在");
       if (Number(log.ageSeconds) > 10 * 60) throw badRequest("只能撤销10分钟内的库存操作");
 
-      const [stockRows] = await connection.execute("select salable_qty, unsalable_qty from sku_inventory where sku_id = ? for update", [log.skuId]);
-      const stock = stockRows[0];
-      if (!stock) throw badRequest("规格库存不存在");
-      let salable = Number(stock.salable_qty);
-      let unsalable = Number(stock.unsalable_qty);
-      const quantity = Number(log.quantity);
-      const stockLabel = Number(log.stockLabel);
-      const operationType = Number(log.operationType);
-      const simultaneousInbound = Number(log.simultaneousInbound) === 1;
+      if (log.skuId) {
+        const [stockRows] = await connection.execute("select salable_qty, unsalable_qty from sku_inventory where sku_id = ? for update", [log.skuId]);
+        const stock = stockRows[0];
+        if (!stock) throw badRequest("规格库存不存在");
+        let salable = Number(stock.salable_qty);
+        let unsalable = Number(stock.unsalable_qty);
+        const quantity = Number(log.quantity);
+        const stockLabel = Number(log.stockLabel);
+        const operationType = Number(log.operationType);
+        const simultaneousInbound = Number(log.simultaneousInbound) === 1;
 
-      if (operationType === 1) {
-        if (stockLabel === 1) salable -= quantity;
-        else unsalable -= quantity;
-      } else if (stockLabel === 1) {
-        salable += quantity;
-      } else {
-        unsalable += quantity;
-        if (simultaneousInbound) salable -= quantity;
+        if (operationType === 1) {
+          if (stockLabel === 1) salable -= quantity;
+          else unsalable -= quantity;
+        } else if (stockLabel === 1) {
+          salable += quantity;
+        } else {
+          unsalable += quantity;
+          if (simultaneousInbound) salable -= quantity;
+        }
+        await connection.execute("update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?", [salable, unsalable, log.skuId]);
       }
-
-      await connection.execute("update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?", [salable, unsalable, log.skuId]);
       await connection.execute("delete from inventory_operation_logs where id = ?", [id]);
     });
     res.json({ ok: true });
@@ -929,9 +1101,9 @@ async function queryInventoryLogs(filters, paging = {}) {
   const { whereSql, params } = buildInventoryLogQueryFilters(filters);
   const fromSql = `from inventory_operation_logs l
        join users u on u.id = l.operator_user_id
-       join skus s on s.id = l.sku_id
-       join products p on p.id = s.product_id
-       join brands b on b.id = p.brand_id
+       left join skus s on s.id = l.sku_id
+       left join products p on p.id = s.product_id
+       left join brands b on b.id = p.brand_id
        ${whereSql}`;
   const [totalRow] = await query(`select count(*) as total ${fromSql}`, params);
   const limitSql = paging.limit ? " limit ? offset ?" : "";
@@ -939,9 +1111,12 @@ async function queryInventoryLogs(filters, paging = {}) {
   const rows = await query(
     `select l.id, l.operation_type as operationType, l.inbound_type as inboundType,
         l.stock_label as stockLabel, l.quantity, l.simultaneous_inbound as simultaneousInbound,
-        case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else '' end as platform,
-        l.remark, date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt, u.name as operatorName,
-        b.name as brandName, p.name as productName, s.name as skuName,
+        case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else '' end as platform,
+        l.remark, l.order_id as orderId, l.shop_name as shopName, l.shop_income as shopIncome,
+        l.is_bug as isBug, l.source_product_text as sourceProductText,
+        date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt,
+        case when l.remark = '拼多多打单同步' then '系统' else u.name end as operatorName,
+        coalesce(b.name, '') as brandName, coalesce(p.name, '') as productName, coalesce(s.name, l.source_product_text, '') as skuName,
         timestampdiff(second, l.created_at, now()) <= 600 as canRevoke
        ${fromSql}
        order by l.id desc${limitSql}`,
@@ -970,7 +1145,7 @@ async function queryInventoryAbnormalLogs(paging = {}) {
   const limitSql = paging.limit ? " limit ? offset ?" : "";
   const limitParams = paging.limit ? [paging.limit, paging.offset || 0] : [];
   const rows = await query(
-    `select l.id, l.quantity, l.reason, date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt,
+    `select l.id, l.quantity, l.stock_label as stockLabel, l.reason, date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt,
         u.name as operatorName, b.name as brandName, p.name as productName, s.name as skuName
        ${fromSql}
        order by l.id desc${limitSql}`,
@@ -1321,7 +1496,7 @@ async function querySalesAmountRows(filters) {
   );
   const platformRows = await query(
     `select b.id as brandId,
-       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else 'none' end as platform,
+       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else 'none' end as platform,
        sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as amount
      from inventory_operation_logs l
      join skus s on s.id = l.sku_id
@@ -1334,13 +1509,13 @@ async function querySalesAmountRows(filters) {
   );
   const platformAmounts = new Map();
   for (const row of platformRows) {
-    const current = platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, none: 0 };
+    const current = platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, kuaishou: 0, none: 0 };
     current[row.platform] = Number(row.amount || 0);
     platformAmounts.set(row.brandId, current);
   }
   return rows.map((row) => ({
     ...row,
-    brandPlatformAmounts: platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, none: 0 },
+    brandPlatformAmounts: platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, kuaishou: 0, none: 0 },
   }));
 }
 
@@ -1348,7 +1523,7 @@ async function querySalesAmountPlatformBreakdown(filters) {
   const { startDate, endDate } = normalizeSalesAmountDateRange(filters);
   return query(
     `select b.id as brandId, p.id as productId, s.id as skuId,
-       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else 'none' end as platform,
+       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else 'none' end as platform,
        sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as amount
      from inventory_operation_logs l
      join skus s on s.id = l.sku_id
@@ -1549,7 +1724,7 @@ function addInventoryCheckTemplateSheet(workbook, catalog) {
     "库存盘点",
     ["品牌名", "商品名", "规格名", "可售库存数", "不可售库存数"],
     catalog.map((row) => ({
-      values: [row.brandName, row.productName, row.skuName, "", ""],
+      values: [row.brandName, row.productName, row.skuName, Number(row.salableQty), Number(row.unsalableQty)],
     })),
   );
   if (catalog.length) mergeSame(sheet, 2, catalog.length + 1, [1, 2], (row, col) => `${col === 1 ? "" : sheet.getCell(row, 1).value}-` + sheet.getCell(row, col).value);
@@ -1736,7 +1911,7 @@ function addInventoryLogsSheet(workbook, logs) {
         row.skuName,
         row.operationType === 1 ? (row.inboundType === 1 ? "新货" : "退货") : "",
         row.stockLabel === 1 ? "可售" : "不可售",
-        row.platform === "douyin" ? "抖音" : row.platform === "pinduoduo" ? "拼多多" : "",
+        row.platform === "douyin" ? "抖音" : row.platform === "pinduoduo" ? "拼多多" : row.platform === "kuaishou" ? "快手" : "",
         row.quantity,
         row.operatorName,
         row.remark,
@@ -1761,43 +1936,98 @@ async function buildInventoryDetailWorkbook() {
   return workbook;
 }
 
-async function buildInventoryAmountWorkbook() {
+async function buildSkuWorkbook(filters = {}) {
+  const productId = Number(filters.productId || 0);
+  const brandId = Number(filters.brandId || 0);
+  const rows = await query(
+    `select s.id, s.product_id as productId, p.name as productName, b.id as brandId, b.name as brandName,
+       s.name as skuName, s.purchase_price as purchasePrice, s.remark, s.sort_order as sortOrder, s.is_hidden as isHidden
+     from skus s
+     join products p on p.id = s.product_id
+     join brands b on b.id = p.brand_id
+     where s.deleted_at is null and p.deleted_at is null and b.deleted_at is null
+       and (? = 0 or s.product_id = ?)
+       and (? = 0 or b.id = ?)
+     order by b.is_hidden, b.sort_order, b.id, p.is_hidden, p.sort_order, p.id, s.is_hidden, s.sort_order, s.id`,
+    [productId, productId, brandId, brandId],
+  );
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "fish-cms";
-  const rows = (await listCatalog()).map((row) => {
-    const quantity = Number(row.salableQty) + Number(row.unsalableQty);
-    const amount = quantity * Number(row.purchasePrice);
-    return { ...row, quantity, amount };
-  });
-  const productTotals = new Map();
-  const brandTotals = new Map();
-  for (const row of rows) {
-    productTotals.set(row.productId, (productTotals.get(row.productId) || 0) + row.amount);
-    brandTotals.set(row.brandId, (brandTotals.get(row.brandId) || 0) + row.amount);
-  }
   const sheet = addRowsSheet(
     workbook,
-    "库存金额",
-    ["品牌名", "商品名", "规格名", "库存总量", "库存金额", "商品总金额", "品牌总金额"],
+    "SKU管理",
+    ["品牌名", "商品名", "规格名", "购入价格", "备注", "是否隐藏"],
     rows.map((row) => ({
       values: [
         row.brandName,
         row.productName,
         row.skuName,
-        row.quantity,
-        row.amount,
+        Number(row.purchasePrice),
+        row.remark || "",
+        row.isHidden ? "隐藏" : "显示",
+      ],
+      hidden: row.isHidden,
+    })),
+  );
+  for (let rowNumber = 2; rowNumber <= rows.length + 1; rowNumber += 1) {
+    sheet.getCell(rowNumber, 4).numFmt = '"¥"#,##0.00;-"¥"#,##0.00';
+  }
+  if (rows.length) {
+    mergeSame(sheet, 2, rows.length + 1, [1, 2], (row, col) => `${col === 1 ? "" : sheet.getCell(row, 1).value}-` + sheet.getCell(row, col).value);
+  }
+  autoWidth(sheet);
+  return workbook;
+}
+
+async function buildInventoryAmountWorkbook() {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  const rows = (await listCatalog()).map((row) => {
+    const salableQty = Number(row.salableQty);
+    const unsalableQty = Number(row.unsalableQty);
+    const purchasePrice = Number(row.purchasePrice);
+    return {
+      ...row,
+      salableQty,
+      unsalableQty,
+      salableAmount: salableQty * purchasePrice,
+      unsalableAmount: unsalableQty * purchasePrice,
+    };
+  });
+  const productTotals = new Map();
+  const brandTotals = new Map();
+  const brandUnsalableTotals = new Map();
+  for (const row of rows) {
+    productTotals.set(row.productId, (productTotals.get(row.productId) || 0) + row.salableAmount);
+    brandTotals.set(row.brandId, (brandTotals.get(row.brandId) || 0) + row.salableAmount);
+    brandUnsalableTotals.set(row.brandId, (brandUnsalableTotals.get(row.brandId) || 0) + row.unsalableAmount);
+  }
+  const sheet = addRowsSheet(
+    workbook,
+    "库存金额",
+    ["品牌名", "商品名", "规格名", "可售库存", "库存金额", "商品总金额", "品牌总金额", "不可售库存量", "不可售库存金额", "品牌总不可售金额"],
+    rows.map((row) => ({
+      values: [
+        row.brandName,
+        row.productName,
+        row.skuName,
+        row.salableQty,
+        row.salableAmount,
         productTotals.get(row.productId) || 0,
         brandTotals.get(row.brandId) || 0,
+        row.unsalableQty,
+        row.unsalableAmount,
+        brandUnsalableTotals.get(row.brandId) || 0,
       ],
     })),
   );
   for (let rowNumber = 2; rowNumber <= rows.length + 1; rowNumber += 1) {
-    for (const columnNumber of [5, 6, 7]) {
+    for (const columnNumber of [5, 6, 7, 9, 10]) {
       sheet.getCell(rowNumber, columnNumber).numFmt = '"¥"#,##0.00;-"¥"#,##0.00';
     }
   }
   if (rows.length) {
-    mergeSame(sheet, 2, rows.length + 1, [1, 7], (row) => sheet.getCell(row, 1).value);
+    mergeSame(sheet, 2, rows.length + 1, [1, 7, 10], (row) => sheet.getCell(row, 1).value);
     mergeSame(sheet, 2, rows.length + 1, [2, 6], (row) => `${sheet.getCell(row, 1).value}-${sheet.getCell(row, 2).value}`);
   }
   autoWidth(sheet);
@@ -1905,6 +2135,95 @@ async function findBrandSalesSubscribers() {
   })).filter((row) => row.brandIds.length > 0);
 }
 
+async function queryDailyBrandSkuRows(brandIds, startAt, endAt, mode) {
+  if (!brandIds.length) return [];
+  const params = [...brandIds, startAt, endAt];
+  const typeFilter = mode === "return" ? "l.operation_type = 1 and l.inbound_type = 2" : "l.operation_type = 2";
+  return query(
+    `select b.id as brandId, b.name as brandName,
+       p.id as productId, p.name as productName,
+       s.id as skuId, s.name as skuName,
+       sum(l.quantity) as quantity,
+       sum(l.quantity * s.purchase_price) as amount
+     from inventory_operation_logs l
+     join skus s on s.id = l.sku_id
+     join products p on p.id = s.product_id
+     join brands b on b.id = p.brand_id
+     where b.id in (${brandIds.map(() => "?").join(",")})
+       and ${typeFilter}
+       and l.created_at between ? and ?
+     group by b.id, b.name, p.id, p.name, s.id, s.name
+     order by b.sort_order, b.id, p.sort_order, p.id, s.sort_order, s.id`,
+    params,
+  );
+}
+
+function addDailySalesSkuSheet(workbook, name, rows, quantityTitle = "销售数量", amountTitle = "销售金额") {
+  const sheet = addRowsSheet(
+    workbook,
+    name,
+    ["品牌名", "商品名", "规格名", quantityTitle, amountTitle, "品牌总金额", "所有品牌销售总金额"],
+    rows.length ? rows.map((row) => ({
+      values: [row.brandName, row.productName, row.skuName, row.quantity, row.amount, row.brandTotalAmount, row.grandTotalAmount],
+    })) : [{ values: ["无数据", "", "", 0, 0, 0, 0] }],
+  );
+  for (let rowNumber = 2; rowNumber <= Math.max(rows.length, 1) + 1; rowNumber += 1) {
+    for (const columnNumber of [5, 6, 7]) {
+      sheet.getCell(rowNumber, columnNumber).numFmt = '"¥"#,##0.00;-"¥"#,##0.00';
+    }
+  }
+  if (rows.length) {
+    mergeSame(sheet, 2, rows.length + 1, [1, 6], (row) => sheet.getCell(row, 1).value);
+    mergeSame(sheet, 2, rows.length + 1, [2], (row) => `${sheet.getCell(row, 1).value}-${sheet.getCell(row, 2).value}`);
+    mergeSame(sheet, 2, rows.length + 1, [7], () => "grand-total");
+  }
+  autoWidth(sheet);
+  return sheet;
+}
+
+function buildDailySalesSkuWorkbook({ salesRows, returnRows, dateText }) {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = "fish-cms";
+  workbook.created = new Date();
+  addDailySalesSkuSheet(workbook, `${dateText}销售`, salesRows, "销售数量", "销售金额");
+  addDailySalesSkuSheet(workbook, `${dateText}退货`, returnRows, "退货数量", "退货金额");
+  return workbook;
+}
+
+function renderDailySalesSkuHtmlTable(title, rows, quantityTitle = "销售数量", amountTitle = "销售金额") {
+  const style = "border:1px solid #6b7280;padding:6px;text-align:left;vertical-align:middle;";
+  const headerStyle = `${style}font-weight:700;background:#f8fafc;`;
+  const header = `<thead><tr><th style="${headerStyle}">品牌名</th><th style="${headerStyle}">商品名</th><th style="${headerStyle}">规格名</th><th style="${headerStyle}">${htmlEscape(quantityTitle)}</th><th style="${headerStyle}">${htmlEscape(amountTitle)}</th><th style="${headerStyle}">品牌总金额</th><th style="${headerStyle}">所有品牌销售总金额</th></tr></thead>`;
+  if (!rows.length) {
+    return `<h3>${htmlEscape(title)}</h3><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:13px;">${header}<tbody><tr><td style="${style}" colspan="7">无数据</td></tr></tbody></table>`;
+  }
+
+  const brandSpans = new Map();
+  const productSpans = new Map();
+  for (const row of rows) {
+    brandSpans.set(row.brandId, (brandSpans.get(row.brandId) || 0) + 1);
+    const productKey = `${row.brandId}-${row.productId}`;
+    productSpans.set(productKey, (productSpans.get(productKey) || 0) + 1);
+  }
+
+  const body = rows.map((row, index) => {
+    const previous = rows[index - 1];
+    const productKey = `${row.brandId}-${row.productId}`;
+    const isBrandStart = !previous || previous.brandId !== row.brandId;
+    const isProductStart = isBrandStart || previous.productId !== row.productId;
+    return `<tr>${
+      isBrandStart ? `<td style="${style}" rowspan="${brandSpans.get(row.brandId)}">${htmlEscape(row.brandName)}</td>` : ""
+    }${
+      isProductStart ? `<td style="${style}" rowspan="${productSpans.get(productKey)}">${htmlEscape(row.productName)}</td>` : ""
+    }<td style="${style}">${htmlEscape(row.skuName)}</td><td style="${style}">${row.quantity}</td><td style="${style}">¥${Number(row.amount).toFixed(2)}</td>${
+      isBrandStart ? `<td style="${style}" rowspan="${brandSpans.get(row.brandId)}">¥${Number(row.brandTotalAmount).toFixed(2)}</td>` : ""
+    }${
+      index === 0 ? `<td style="${style}" rowspan="${rows.length}">¥${Number(row.grandTotalAmount).toFixed(2)}</td>` : ""
+    }</tr>`;
+  }).join("");
+  return `<h3>${htmlEscape(title)}</h3><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;font-size:13px;">${header}<tbody>${body}</tbody></table>`;
+}
+
 async function queryDailyBrandProductRows(brandIds, startAt, endAt, mode) {
   if (!brandIds.length) return [];
   const params = [...brandIds, startAt, endAt];
@@ -1986,9 +2305,9 @@ function renderDailySalesHtmlTable(title, rows, quantityTitle = "销售数量", 
 }
 
 async function sendDailySalesSubscriptionEmail(subscriber, dateRange) {
-  const salesRows = withBrandAndGrandTotals(await queryDailyBrandProductRows(subscriber.brandIds, dateRange.startAt, dateRange.endAt, "sales"));
-  const returnRows = withBrandAndGrandTotals(await queryDailyBrandProductRows(subscriber.brandIds, dateRange.startAt, dateRange.endAt, "return"));
-  const workbook = buildDailySalesWorkbook({ salesRows, returnRows, dateText: dateRange.dateText });
+  const salesRows = withBrandAndGrandTotals(await queryDailyBrandSkuRows(subscriber.brandIds, dateRange.startAt, dateRange.endAt, "sales"));
+  const returnRows = withBrandAndGrandTotals(await queryDailyBrandSkuRows(subscriber.brandIds, dateRange.startAt, dateRange.endAt, "return"));
+  const workbook = buildDailySalesSkuWorkbook({ salesRows, returnRows, dateText: dateRange.dateText });
   const buffer = Buffer.from(await workbook.xlsx.writeBuffer());
   const { default: nodemailer } = await import("nodemailer");
   const portNumber = Number(process.env.SMTP_PORT || 465);
@@ -2002,7 +2321,7 @@ async function sendDailySalesSubscriptionEmail(subscriber, dateRange) {
     from: process.env.SMTP_FROM || process.env.SMTP_USER,
     to: subscriber.email,
     subject: `${dateRange.dateText} 品牌销售日报`,
-    html: `<p>${htmlEscape(subscriber.name)}，附件为今日订阅品牌销售日报。</p>${renderDailySalesHtmlTable("今日销售数据", salesRows, "销售数量", "销售金额")}<br/>${renderDailySalesHtmlTable("今日退货数据", returnRows, "退货数量", "退货金额")}`,
+    html: `<p>${htmlEscape(subscriber.name)}，附件为今日订阅品牌销售日报。</p>${renderDailySalesSkuHtmlTable("今日销售数据", salesRows, "销售数量", "销售金额")}<br/>${renderDailySalesSkuHtmlTable("今日退货数据", returnRows, "退货数量", "退货金额")}`,
     attachments: [{
       filename: `${dateRange.dateText}_品牌销售日报.xlsx`,
       content: buffer,
@@ -2162,7 +2481,7 @@ async function buildSalesAmountWorkbook(filters) {
   const productPlatformTotals = new Map();
   const brandPlatformTotals = new Map();
   const addPlatformAmount = (map, key, platform, amount) => {
-    const current = map.get(key) || { douyin: 0, pinduoduo: 0, none: 0 };
+    const current = map.get(key) || { douyin: 0, pinduoduo: 0, kuaishou: 0, none: 0 };
     current[platform] = (current[platform] || 0) + Number(amount || 0);
     map.set(key, current);
   };
@@ -2177,10 +2496,11 @@ async function buildSalesAmountWorkbook(filters) {
     addPlatformAmount(brandPlatformTotals, row.brandId, row.platform, row.amount);
   }
   const platformText = (amounts) => {
-    const source = amounts || { douyin: 0, pinduoduo: 0, none: 0 };
+    const source = amounts || { douyin: 0, pinduoduo: 0, kuaishou: 0, none: 0 };
     const lines = [
       ["拼多多", source.pinduoduo || 0],
       ["抖音", source.douyin || 0],
+      ["快手", source.kuaishou || 0],
     ];
     if (Number(source.none || 0) !== 0) lines.push(["未选择", source.none || 0]);
     return lines.map(([label, amount]) => `${label}：¥${Number(amount).toFixed(2)}`).join("\n");
@@ -2236,7 +2556,7 @@ async function buildExportWorkbook() {
     query(
       `select date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt,
           l.operation_type as operationType, l.inbound_type as inboundType, l.stock_label as stockLabel,
-          case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' else '' end as platform,
+          case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else '' end as platform,
           b.name as brandName, p.name as productName, s.name as skuName, l.quantity, u.name as operatorName, l.remark
        from inventory_operation_logs l
        join users u on u.id = l.operator_user_id
@@ -2294,7 +2614,7 @@ async function buildExportWorkbook() {
         row.skuName,
         row.operationType === 1 ? (row.inboundType === 1 ? "新货" : "退货") : "",
         row.stockLabel === 1 ? "可售" : "不可售",
-        row.platform === "douyin" ? "抖音" : row.platform === "pinduoduo" ? "拼多多" : "",
+        row.platform === "douyin" ? "抖音" : row.platform === "pinduoduo" ? "拼多多" : row.platform === "kuaishou" ? "快手" : "",
         row.quantity,
         row.operatorName,
         row.remark,
@@ -2338,7 +2658,7 @@ function buildImportSql(workbook) {
     const operationType = row["类型"] === "入库" ? 1 : 2;
     const inboundType = row["入库类型"] === "新货" ? 1 : row["入库类型"] === "退货" ? 2 : "null";
     const stockLabel = row["标签"] === "不可售" ? 2 : 1;
-    const platform = row["平台"] === "抖音" ? 1 : row["平台"] === "拼多多" ? 2 : "null";
+    const platform = row["平台"] === "抖音" ? 1 : row["平台"] === "拼多多" ? 2 : row["平台"] === "快手" ? 3 : "null";
     lines.push(`insert into inventory_operation_logs(sku_id, operation_type, inbound_type, stock_label, platform, quantity, simultaneous_inbound, remark, operator_user_id, created_at) select s.id, ${operationType}, ${inboundType}, ${stockLabel}, ${platform}, ${Number(row["数量"] || 0)}, 0, ${sqlValue(row["备注"])}, u.id, ${sqlValue(row["时间"])} from skus s join products p on p.id = s.product_id join brands b on b.id = p.brand_id join users u on u.name = ${sqlValue(row["操作人"])} where b.name = ${sqlValue(row["品牌名"])} and p.name = ${sqlValue(row["商品名"])} and s.name = ${sqlValue(row["规格名"])};`);
   }
   lines.push("commit;");
@@ -2363,6 +2683,18 @@ app.get("/api/excel/export/inventory-detail", requireAuth, readScope, async (_re
     const buffer = await workbook.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", "attachment; filename=inventory-detail.xlsx");
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/excel/export/skus", requireAuth, requireSuper, async (req, res, next) => {
+  try {
+    const workbook = await buildSkuWorkbook(req.query);
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=skus.xlsx");
     res.send(Buffer.from(buffer));
   } catch (error) {
     next(error);
