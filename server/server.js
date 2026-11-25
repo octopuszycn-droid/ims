@@ -873,6 +873,20 @@ function normalizeProductMatch(value) {
     .replace(/[\s\p{P}\p{S}]+/gu, "");
 }
 
+function normalizeBrandMatch(value) {
+  return String(value || "").toLowerCase().replace(/渔/g, "鱼").replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function findMatchingBrand(brands, sourceText) {
+  const exactMatch = brands.find((brand) => brand.name && sourceText.includes(brand.name));
+  if (exactMatch) return exactMatch;
+  const normalizedText = normalizeBrandMatch(sourceText);
+  return brands.find((brand) => {
+    const name = normalizeBrandMatch(brand.name);
+    return name && normalizedText.includes(name);
+  }) || null;
+}
+
 async function backfillPddOrderMatches() {
   const [logs] = await pool.execute(
     "select id, source_product_text from inventory_operation_logs where is_bug=1 and matched_brand_id is null and source_product_text is not null",
@@ -883,7 +897,7 @@ async function backfillPddOrderMatches() {
   const productsByBrand = new Map();
   for (const log of logs) {
     const text = String(log.source_product_text || "");
-    const brand = orderedBrands.find((row) => text.includes(row.name));
+    const brand = findMatchingBrand(orderedBrands, text);
     if (!brand) continue;
     if (!productsByBrand.has(brand.id)) {
       const [products] = await pool.execute(
@@ -933,7 +947,7 @@ app.post("/api/inventory/orders/sync", requireAuth, requireAnyPermission(["INVEN
         const text = String(item.productText || "").trim();
         const quantity = toPositiveInteger(item.quantity, "数量");
         if (!String(item.orderId || "").trim()) throw badRequest("订单编号不能为空");
-        const brand = brands.find((row) => row.name && text.includes(row.name));
+        const brand = findMatchingBrand(brands, text);
         let product = null;
         let sku = null;
         if (brand) {
