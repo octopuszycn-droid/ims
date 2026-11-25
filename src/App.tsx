@@ -2317,11 +2317,18 @@ function LogTable({
   const productOptions = useMemo(() => {
     const map = new Map<number, { id: number; brandId: number; name: string }>();
     for (const row of catalogRows) {
-      if (filters.brandId && row.brandId !== Number(filters.brandId)) continue;
+      if (resolveBrandId && row.brandId !== Number(resolveBrandId)) continue;
       map.set(row.productId, { id: row.productId, brandId: row.brandId, name: row.productName });
     }
     return [...map.values()];
-  }, [catalogRows, filters.brandId]);
+  }, [catalogRows, resolveBrandId]);
+
+  function openOrderDialog(log: InventoryLog) {
+    setOrderDialog(log);
+    setResolveBrandId(log.brandId ? String(log.brandId) : "");
+    setResolveProductId(log.productId ? String(log.productId) : "");
+    setResolveSkuId("");
+  }
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
@@ -2442,7 +2449,7 @@ function LogTable({
                 {log.shopName && <InfoLine label="店铺名" value={log.shopName} />}
                 {log.shopIncome != null && <InfoLine label="实收金额" value={`¥${Number(log.shopIncome).toFixed(2)}`} />}
               </div>
-              {log.isBug ? <ActionLink onClick={() => { setOrderDialog(log); setResolveSkuId(""); setResolveBrandId(""); setResolveProductId(""); }}>补全商品信息</ActionLink> : log.orderId ? <ActionLink onClick={() => setOrderDialog(log)}>关联订单</ActionLink> : null}
+              {log.isBug ? <ActionLink onClick={() => openOrderDialog(log)}>补全商品信息</ActionLink> : log.orderId ? <ActionLink onClick={() => setOrderDialog(log)}>关联订单</ActionLink> : null}
             </article>
           ))}
         </div>
@@ -2479,7 +2486,7 @@ function LogTable({
                 <td className={tdBase}>{log.operatorName}</td>
                 <td className={tdBase}>{log.remark || "-"}</td>
                 <td className={actionTd}>
-                  <div className="flex flex-wrap items-center gap-2">{renderRevokeAction(log)}{log.isBug ? <ActionLink onClick={() => { setOrderDialog(log); setResolveSkuId(""); setResolveBrandId(""); setResolveProductId(""); }}>补全商品信息</ActionLink> : log.orderId ? <ActionLink onClick={() => setOrderDialog(log)}>关联订单</ActionLink> : null}</div>
+                  <div className="flex flex-wrap items-center gap-2">{renderRevokeAction(log)}{log.isBug ? <ActionLink onClick={() => openOrderDialog(log)}>补全商品信息</ActionLink> : log.orderId ? <ActionLink onClick={() => setOrderDialog(log)}>关联订单</ActionLink> : null}</div>
                 </td>
               </tr>
             ))}

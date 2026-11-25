@@ -109,6 +109,8 @@ create table if not exists `inventory_operation_logs` (
   `shop_income` decimal(12,2) null comment '实收金额',
   `is_bug` tinyint unsigned not null default 0 comment '商品匹配异常标记',
   `source_product_text` varchar(1000) null comment '打单商品原始文本',
+  `matched_brand_id` bigint unsigned null comment '打单匹配到的品牌ID',
+  `matched_product_id` bigint unsigned null comment '打单匹配到的商品ID',
   `operator_user_id` bigint unsigned not null comment '操作人用户ID',
   `created_at` datetime not null default current_timestamp comment '创建时间',
   primary key (`id`),
@@ -201,6 +203,8 @@ alter table `inventory_operation_logs` add column if not exists `shop_name` varc
 alter table `inventory_operation_logs` add column if not exists `shop_income` decimal(12,2) null comment '实收金额';
 alter table `inventory_operation_logs` add column if not exists `is_bug` tinyint unsigned not null default 0 comment '商品匹配异常标记';
 alter table `inventory_operation_logs` add column if not exists `source_product_text` varchar(1000) null comment '打单商品原始文本';
+alter table `inventory_operation_logs` add column if not exists `matched_brand_id` bigint unsigned null comment '打单匹配到的品牌ID';
+alter table `inventory_operation_logs` add column if not exists `matched_product_id` bigint unsigned null comment '打单匹配到的商品ID';
 alter table `inventory_operation_logs` drop constraint if exists `chk_inventory_logs_platform`;
 alter table `inventory_operation_logs` add constraint `chk_inventory_logs_platform` check (`platform` is null or `platform` in (1, 2, 3));
 alter table `inventory_checks` add column if not exists `upload_file_path` varchar(255) not null default '' comment '盘点上传原始文件相对路径' after `operator_user_id`;

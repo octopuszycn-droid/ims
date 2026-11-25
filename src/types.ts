@@ -99,6 +99,8 @@ export type InventoryLog = {
   shopIncome?: number | null;
   isBug?: 0 | 1 | boolean;
   sourceProductText?: string | null;
+  brandId?: number | null;
+  productId?: number | null;
 };
 
 export type InventoryLogFilters = {

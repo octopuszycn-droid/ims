@@ -46,6 +46,8 @@ async function ensureSchema() {
   await query("alter table inventory_operation_logs add column if not exists shop_income decimal(12,2) null comment '实收金额'");
   await query("alter table inventory_operation_logs add column if not exists is_bug tinyint unsigned not null default 0 comment '商品匹配异常标记'");
   await query("alter table inventory_operation_logs add column if not exists source_product_text varchar(1000) null comment '打单商品原始文本'");
+  await query("alter table inventory_operation_logs add column if not exists matched_brand_id bigint unsigned null comment '打单匹配到的品牌ID'");
+  await query("alter table inventory_operation_logs add column if not exists matched_product_id bigint unsigned null comment '打单匹配到的商品ID'");
   await query(`create table if not exists inventory_checks (
     id bigint unsigned not null auto_increment comment '盘点记录ID',
     check_time datetime not null default current_timestamp comment '盘点时间',
@@ -138,6 +140,7 @@ async function ensureSchema() {
   } catch (error) {
     if (error.code !== "ER_DUP_CHECK_CONSTRAINT_NAME") throw error;
   }
+  await backfillPddOrderMatches();
 }
 
 function badRequest(message) {
@@ -866,11 +869,43 @@ app.post("/api/inventory/operations/batch", requireAuth, requireAnyPermission(["
 function normalizeProductMatch(value) {
   return String(value || "").toLowerCase()
     .replace(/超轻超硬|超轻|轻量|小综合|综合竿|超硬|野钓|黑坑|碳素|鱼竿|钓竿|台钓|鲫鲤|全新正品|防伪可查|假一赔十|不支持下水试用/g, "")
+    .replace(/[一二三四五六七八九十]/g, (digit) => ({ 一: "1", 二: "2", 三: "3", 四: "4", 五: "5", 六: "6", 七: "7", 八: "8", 九: "9", 十: "10" })[digit])
     .replace(/[\s\p{P}\p{S}]+/gu, "");
 }
 
+async function backfillPddOrderMatches() {
+  const [logs] = await pool.execute(
+    "select id, source_product_text from inventory_operation_logs where is_bug=1 and matched_brand_id is null and source_product_text is not null",
+  );
+  if (!logs.length) return;
+  const [brands] = await pool.execute("select id, name from brands where deleted_at is null order by sort_order, id");
+  const orderedBrands = brands.filter((brand) => brand.name && String(brand.name).trim());
+  const productsByBrand = new Map();
+  for (const log of logs) {
+    const text = String(log.source_product_text || "");
+    const brand = orderedBrands.find((row) => text.includes(row.name));
+    if (!brand) continue;
+    if (!productsByBrand.has(brand.id)) {
+      const [products] = await pool.execute(
+        "select id, name from products where brand_id=? and deleted_at is null order by sort_order,id",
+        [brand.id],
+      );
+      productsByBrand.set(brand.id, products);
+    }
+    const normalizedText = normalizeProductMatch(text);
+    const product = productsByBrand.get(brand.id)
+      .map((row) => ({ ...row, matchName: normalizeProductMatch(row.name) }))
+      .filter((row) => row.matchName && normalizedText.includes(row.matchName))
+      .sort((a, b) => b.matchName.length - a.matchName.length)[0];
+    await pool.execute(
+      "update inventory_operation_logs set matched_brand_id=?, matched_product_id=? where id=?",
+      [brand.id, product?.id || null, log.id],
+    );
+  }
+}
+
 function normalizeSkuMatch(value) {
-  return String(value || "").toLowerCase().replace(/\s+/g, "").replace(/米|厘米|cm|mm|m/g, "").replace(/[^a-z0-9.]/g, "");
+  return String(value || "").toLowerCase().replace(/\s+/g, "").replace(/米|厘米|cm|mm|m/g, "").replace(/[^\p{L}0-9.]/gu, "");
 }
 
 function findMatchingSku(skus, productText) {
@@ -892,24 +927,24 @@ app.post("/api/inventory/orders/sync", requireAuth, requireAnyPermission(["INVEN
     if (!platform) throw badRequest("平台不合法");
     if (!orders.length || orders.length > 500) throw badRequest("订单明细数量不合法");
     const results = await withTransaction(async (connection) => {
-      const [brands] = await connection.execute("select id, name from brands where deleted_at is null and is_hidden = 0 order by sort_order, id");
+      const [brands] = await connection.execute("select id, name from brands where deleted_at is null order by sort_order, id");
       const created = [];
       for (const item of orders) {
         const text = String(item.productText || "").trim();
         const quantity = toPositiveInteger(item.quantity, "数量");
         if (!String(item.orderId || "").trim()) throw badRequest("订单编号不能为空");
-        const brand = [...brands].sort((a, b) => b.name.length - a.name.length).find((row) => text.includes(row.name));
+        const brand = brands.find((row) => row.name && text.includes(row.name));
         let product = null;
         let sku = null;
         if (brand) {
-          const [products] = await connection.execute("select id, name from products where brand_id=? and deleted_at is null and is_hidden=0 order by sort_order,id", [brand.id]);
+          const [products] = await connection.execute("select id, name from products where brand_id=? and deleted_at is null order by sort_order,id", [brand.id]);
           const normalizedText = normalizeProductMatch(text);
           product = [...products]
             .map((row) => ({ ...row, matchName: normalizeProductMatch(row.name) }))
             .filter((row) => row.matchName && normalizedText.includes(row.matchName))
             .sort((a, b) => b.matchName.length - a.matchName.length)[0] || null;
           if (product) {
-            const [skus] = await connection.execute("select id, name from skus where product_id=? and deleted_at is null and is_hidden=0 order by sort_order,id", [product.id]);
+            const [skus] = await connection.execute("select id, name from skus where product_id=? and deleted_at is null order by sort_order,id", [product.id]);
             sku = findMatchingSku(skus, text);
           }
         }
@@ -925,9 +960,9 @@ app.post("/api/inventory/orders/sync", requireAuth, requireAnyPermission(["INVEN
         } else {
           const income = orderMeta.shopIncome == null || orderMeta.shopIncome === "" ? null : Number(orderMeta.shopIncome);
           const [log] = await connection.execute(
-            `insert into inventory_operation_logs (sku_id,operation_type,inbound_type,stock_label,platform,quantity,remark,order_id,shop_name,shop_income,is_bug,source_product_text,operator_user_id)
-             values(null,2,null,1,?,?,'拼多多打单同步',?,?,?,?,?,?)`,
-            [platform, quantity, orderMeta.orderId, orderMeta.shopName, income, 1, text, req.user.id],
+            `insert into inventory_operation_logs (sku_id,operation_type,inbound_type,stock_label,platform,quantity,remark,order_id,shop_name,shop_income,is_bug,source_product_text,matched_brand_id,matched_product_id,operator_user_id)
+             values(null,2,null,1,?,?,'拼多多打单同步',?,?,?,?,?,?,?,?)`,
+            [platform, quantity, orderMeta.orderId, orderMeta.shopName, income, 1, text, brand?.id || null, product?.id || null, req.user.id],
           );
           created.push({ id: log.insertId, isBug: true });
         }
@@ -947,12 +982,12 @@ app.patch("/api/inventory/orders/:id/resolve", requireAuth, requireAnyPermission
       const [logs] = await connection.execute("select * from inventory_operation_logs where id=? and is_bug=1 for update", [id]);
       const log = logs[0];
       if (!log) throw badRequest("异常订单不存在或已补全");
-      const [stocks] = await connection.execute("select salable_qty from sku_inventory where sku_id=? for update", [skuId]);
+      const [stocks] = await connection.execute("select i.salable_qty,p.id as productId,b.id as brandId from sku_inventory i join skus s on s.id=i.sku_id join products p on p.id=s.product_id join brands b on b.id=p.brand_id where i.sku_id=? for update", [skuId]);
       if (!stocks[0]) throw badRequest("规格库存不存在");
       const qty = Number(stocks[0].salable_qty) - Number(log.quantity);
       if (qty < 0) throw badRequest("可售库存不足，无法完成出库");
       await connection.execute("update sku_inventory set salable_qty=? where sku_id=?", [qty, skuId]);
-      await connection.execute("update inventory_operation_logs set sku_id=?,is_bug=0 where id=?", [skuId, id]);
+      await connection.execute("update inventory_operation_logs set sku_id=?,matched_brand_id=?,matched_product_id=?,is_bug=0 where id=?", [skuId, stocks[0].brandId, stocks[0].productId, id]);
     });
     res.json({ ok: true });
   } catch (error) { next(error); }
@@ -1102,8 +1137,8 @@ async function queryInventoryLogs(filters, paging = {}) {
   const fromSql = `from inventory_operation_logs l
        join users u on u.id = l.operator_user_id
        left join skus s on s.id = l.sku_id
-       left join products p on p.id = s.product_id
-       left join brands b on b.id = p.brand_id
+       left join products p on p.id = coalesce(s.product_id, l.matched_product_id)
+       left join brands b on b.id = coalesce(p.brand_id, l.matched_brand_id)
        ${whereSql}`;
   const [totalRow] = await query(`select count(*) as total ${fromSql}`, params);
   const limitSql = paging.limit ? " limit ? offset ?" : "";
@@ -1116,7 +1151,7 @@ async function queryInventoryLogs(filters, paging = {}) {
         l.is_bug as isBug, l.source_product_text as sourceProductText,
         date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt,
         case when l.remark = '拼多多打单同步' then '系统' else u.name end as operatorName,
-        coalesce(b.name, '') as brandName, coalesce(p.name, '') as productName, coalesce(s.name, l.source_product_text, '') as skuName,
+        b.id as brandId, p.id as productId, coalesce(b.name, '') as brandName, coalesce(p.name, '') as productName, coalesce(s.name, l.source_product_text, '') as skuName,
         timestampdiff(second, l.created_at, now()) <= 600 as canRevoke
        ${fromSql}
        order by l.id desc${limitSql}`,
