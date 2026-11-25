@@ -2536,6 +2536,7 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const abnormalRequestId = useRef(0);
   const recordPagination = usePagination(records, 5);
   const detailPagination = usePagination(detailRows);
   const abnormalPageSize = 20;
@@ -2556,14 +2557,18 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
   }
 
   async function loadAbnormalLogs(nextPage = abnormalPage, range = abnormalDateRange) {
+    const requestId = ++abnormalRequestId.current;
     setError("");
     try {
       const result = await api.abnormalLogs(token, nextPage, abnormalPageSize, range);
+      if (requestId !== abnormalRequestId.current) return;
       setAbnormalLogs(result.rows);
       setAbnormalTotal(result.total);
       setAbnormalPage(nextPage);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "异常库存记录加载失败");
+      if (requestId === abnormalRequestId.current) {
+        setError(nextError instanceof Error ? nextError.message : "异常库存记录加载失败");
+      }
     }
   }
 
