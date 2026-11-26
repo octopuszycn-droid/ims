@@ -886,14 +886,32 @@ function normalizeBrandMatch(value) {
   return String(value || "").toLowerCase().replace(/渔/g, "鱼").replace(/[\s\p{P}\p{S}]+/gu, "");
 }
 
+function nameCharacterCount(value) {
+  return [...String(value || "")].length;
+}
+
+function findLongestNameMatch(rows, sourceText, normalize) {
+  const candidates = rows.filter((row) => String(row.name || "").trim());
+  const normalizedText = normalize(sourceText);
+  return candidates
+    .map((row) => ({
+      row,
+      exactMatch: String(sourceText || "").includes(String(row.name)),
+      matchName: normalize(row.name),
+    }))
+    .filter((candidate) => candidate.exactMatch || (candidate.matchName && normalizedText.includes(candidate.matchName)))
+    .sort((a, b) => nameCharacterCount(b.matchName) - nameCharacterCount(a.matchName)
+      || Number(b.exactMatch) - Number(a.exactMatch)
+      || nameCharacterCount(b.row.name) - nameCharacterCount(a.row.name))
+    .map((candidate) => candidate.row)[0] || null;
+}
+
 function findMatchingBrand(brands, sourceText) {
-  const exactMatch = brands.find((brand) => brand.name && sourceText.includes(brand.name));
-  if (exactMatch) return exactMatch;
-  const normalizedText = normalizeBrandMatch(sourceText);
-  return brands.find((brand) => {
-    const name = normalizeBrandMatch(brand.name);
-    return name && normalizedText.includes(name);
-  }) || null;
+  return findLongestNameMatch(brands, sourceText, normalizeBrandMatch);
+}
+
+function findMatchingProduct(products, sourceText) {
+  return findLongestNameMatch(products, sourceText, normalizeProductMatch);
 }
 
 async function backfillPddOrderMatches() {
@@ -901,7 +919,7 @@ async function backfillPddOrderMatches() {
     "select id, source_product_text from inventory_operation_logs where is_bug=1 and matched_brand_id is null and source_product_text is not null",
   );
   if (!logs.length) return;
-  const [brands] = await pool.execute("select id, name from brands where deleted_at is null order by sort_order, id");
+  const [brands] = await pool.execute("select id, name from brands where deleted_at is null order by char_length(name) desc, sort_order, id");
   const orderedBrands = brands.filter((brand) => brand.name && String(brand.name).trim());
   const productsByBrand = new Map();
   for (const log of logs) {
@@ -910,16 +928,12 @@ async function backfillPddOrderMatches() {
     if (!brand) continue;
     if (!productsByBrand.has(brand.id)) {
       const [products] = await pool.execute(
-        "select id, name from products where brand_id=? and deleted_at is null order by sort_order,id",
+        "select id, name from products where brand_id=? and deleted_at is null order by char_length(name) desc, sort_order, id",
         [brand.id],
       );
       productsByBrand.set(brand.id, products);
     }
-    const normalizedText = normalizeProductMatch(text);
-    const product = productsByBrand.get(brand.id)
-      .map((row) => ({ ...row, matchName: normalizeProductMatch(row.name) }))
-      .filter((row) => row.matchName && normalizedText.includes(row.matchName))
-      .sort((a, b) => b.matchName.length - a.matchName.length)[0];
+    const product = findMatchingProduct(productsByBrand.get(brand.id), text);
     await pool.execute(
       "update inventory_operation_logs set matched_brand_id=?, matched_product_id=? where id=?",
       [brand.id, product?.id || null, log.id],
@@ -950,7 +964,7 @@ app.post("/api/inventory/orders/sync", requireAuth, requireAnyPermission(["INVEN
     if (!platform) throw badRequest("平台不合法");
     if (!orders.length || orders.length > 500) throw badRequest("订单明细数量不合法");
     const result = await withTransaction(async (connection) => {
-      const [brands] = await connection.execute("select id, name from brands where deleted_at is null order by sort_order, id");
+      const [brands] = await connection.execute("select id, name from brands where deleted_at is null order by char_length(name) desc, sort_order, id");
       const prepared = [];
       const failures = new Map();
       const addFailure = (orderId, reason) => {
@@ -977,12 +991,8 @@ app.post("/api/inventory/orders/sync", requireAuth, requireAnyPermission(["INVEN
         let product = null;
         let sku = null;
         if (brand) {
-          const [products] = await connection.execute("select id, name from products where brand_id=? and deleted_at is null order by sort_order,id", [brand.id]);
-          const normalizedText = normalizeProductMatch(text);
-          product = [...products]
-            .map((row) => ({ ...row, matchName: normalizeProductMatch(row.name) }))
-            .filter((row) => row.matchName && normalizedText.includes(row.matchName))
-            .sort((a, b) => b.matchName.length - a.matchName.length)[0] || null;
+          const [products] = await connection.execute("select id, name from products where brand_id=? and deleted_at is null order by char_length(name) desc, sort_order, id", [brand.id]);
+          product = findMatchingProduct(products, text);
           if (product) {
             const [skus] = await connection.execute("select id, name from skus where product_id=? and deleted_at is null order by sort_order,id", [product.id]);
             sku = findMatchingSku(skus, text);
