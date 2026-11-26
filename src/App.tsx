@@ -1056,7 +1056,7 @@ export function App() {
               const selectedBrand = brands.find((brand) => brand.id === brandId);
               const nextPlatform = dialog === "outbound" ? getOutboundPlatform(selectedBrand) : "";
               patchForm("platform", nextPlatform);
-              patchForm("rows", (form.rows || []).map((row: Record<string, unknown>) => ({ ...row, platform: nextPlatform })));
+              patchForm("rows", (form.rows || []).map((row: Record<string, unknown>) => ({ ...row, skuId: "", platform: nextPlatform })));
             }
             await loadModalProducts(brandId, undefined, shouldAutoPick);
           }}
@@ -1065,6 +1065,9 @@ export function App() {
             patchForm("productId", productId);
             patchForm("skuId", "");
             setCurrentStock(null);
+            if (dialog === "inbound" || dialog === "outbound") {
+              patchForm("rows", (form.rows || []).map((row: Record<string, unknown>) => ({ ...row, skuId: "" })));
+            }
             await loadModalSkus(productId, undefined, shouldAutoPick);
           }}
           onClose={() => setDialog(null)}
@@ -3887,9 +3890,11 @@ function EditorDialog({
                             维修
                           </label>
                         </>}
-                        <Select aria-label="平台" value={row.platform || ""} onChange={(event) => updateRow(index, "platform", event.target.value)}>
-                          <option value="" disabled hidden>请选择平台</option>{platformOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                        </Select>
+                        {(dialog === "outbound" || row.inboundType === "return") ? (
+                          <Select aria-label="平台" value={row.platform || ""} onChange={(event) => updateRow(index, "platform", event.target.value)}>
+                            <option value="" disabled hidden>请选择平台</option>{platformOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                          </Select>
+                        ) : <div aria-hidden="true" className="min-h-10" />}
                         {dialog === "outbound" && <>
                           <Input aria-label="订单编号" placeholder="订单编号" value={row.orderId || ""} onChange={(event) => updateRow(index, "orderId", event.target.value)} />
                           <Input aria-label="实收金额" placeholder="实收金额" type="number" min="0" step="0.01" value={row.shopIncome || ""} onChange={(event) => updateRow(index, "shopIncome", event.target.value)} />
