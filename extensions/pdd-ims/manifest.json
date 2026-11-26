@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "IMS 打单订单出库",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "同步打单页面勾选订单到 IMS 库存操作。",
   "permissions": ["activeTab", "storage"],
-  "host_permissions": ["https://whblf.work/*", "http://127.0.0.1:3001/*", "http://localhost:3001/*"],
+  "host_permissions": ["https://whblf.work/*", "http://127.0.0.1:3001/*", "http://localhost:3001/*", "http://127.0.0.1:5173/*", "http://localhost:5173/*"],
   "action": { "default_popup": "popup.html" },
   "background": { "service_worker": "background.js" },
   "content_scripts": [{

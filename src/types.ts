@@ -17,7 +17,7 @@ export type Session = {
   permissions: PermissionCode[];
 };
 
-export type PlatformValue = "douyin" | "pinduoduo" | "kuaishou" | "";
+export type PlatformValue = "douyin" | "pinduoduo" | "kuaishou" | "xianyu" | "wechat" | "video_account" | "";
 
 export type Brand = {
   id: number;
@@ -83,6 +83,7 @@ export type InventoryLog = {
   id: number;
   operationType: 1 | 2;
   inboundType: 1 | 2 | null;
+  isRepair: 0 | 1 | boolean;
   stockLabel: 1 | 2;
   quantity: number;
   simultaneousInbound: 0 | 1;
@@ -188,6 +189,9 @@ export type SalesAmountRow = {
     douyin: number;
     pinduoduo: number;
     kuaishou: number;
+    xianyu: number;
+    wechat: number;
+    video_account: number;
     none: number;
   };
 };

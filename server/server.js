@@ -36,10 +36,11 @@ await ensureSchema();
 async function ensureSchema() {
   await query("alter table users modify column email varchar(128) null comment 'optional notification email'");
   await query("alter table brands add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
-  await query("alter table brands add column if not exists default_platform tinyint unsigned null comment '默认平台：1抖音，2拼多多，3快手，为空表示未选择' after remark");
+  await query("alter table brands add column if not exists default_platform tinyint unsigned null comment '默认平台：1抖音，2拼多多，3快手，4闲鱼，5微信，6视频号，为空表示未选择' after remark");
   await query("alter table products add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
   await query("alter table skus add column if not exists is_hidden tinyint unsigned not null default 0 comment '是否隐藏：0否，1是' after sort_order");
-  await query("alter table inventory_operation_logs add column if not exists platform tinyint unsigned null comment '平台：1抖音，2拼多多，3快手，为空表示未选择' after stock_label");
+  await query("alter table inventory_operation_logs add column if not exists platform tinyint unsigned null comment '平台：1抖音，2拼多多，3快手，4闲鱼，5微信，6视频号，为空表示未选择' after stock_label");
+  await query("alter table inventory_operation_logs add column if not exists is_repair tinyint unsigned not null default 0 comment '维修标记：0否，1是' after inbound_type");
   await query("alter table inventory_operation_logs modify column sku_id bigint unsigned null comment 'SKU ID；打单匹配失败时为空'");
   await query("alter table inventory_operation_logs add column if not exists order_id varchar(64) null comment '订单编号'");
   await query("alter table inventory_operation_logs add column if not exists shop_name varchar(128) null comment '店铺名'");
@@ -128,15 +129,15 @@ async function ensureSchema() {
     constraint fk_user_brand_subscriptions_user foreign key (user_id) references users (id) on delete cascade,
     constraint fk_user_brand_subscriptions_brand foreign key (brand_id) references brands (id) on delete cascade
   ) engine=InnoDB default charset=utf8mb4 collate=utf8mb4_unicode_ci comment='user subscribed brands'`);
-  await query("alter table brands modify column default_platform tinyint unsigned null comment 'default platform: 1 douyin, 2 pinduoduo, 3 kuaishou, null none'");
-  await query("alter table inventory_operation_logs modify column platform tinyint unsigned null comment 'platform: 1 douyin, 2 pinduoduo, 3 kuaishou, null none'");
+  await query("alter table brands modify column default_platform tinyint unsigned null comment 'default platform: 1 douyin, 2 pinduoduo, 3 kuaishou, 4 xianyu, 5 wechat, 6 video account, null none'");
+  await query("alter table inventory_operation_logs modify column platform tinyint unsigned null comment 'platform: 1 douyin, 2 pinduoduo, 3 kuaishou, 4 xianyu, 5 wechat, 6 video account, null none'");
   try {
     await query("alter table inventory_operation_logs drop constraint chk_inventory_logs_platform");
   } catch (error) {
     if (!["ER_CANT_DROP_FIELD_OR_KEY", "ER_CHECK_CONSTRAINT_NOT_FOUND"].includes(error.code)) throw error;
   }
   try {
-    await query("alter table inventory_operation_logs add constraint chk_inventory_logs_platform check (platform is null or platform in (1, 2, 3))");
+    await query("alter table inventory_operation_logs add constraint chk_inventory_logs_platform check (platform is null or platform in (1, 2, 3, 4, 5, 6))");
   } catch (error) {
     if (error.code !== "ER_DUP_CHECK_CONSTRAINT_NAME") throw error;
   }
@@ -188,7 +189,14 @@ function normalizePlatform(value) {
   if (value === "douyin") return 1;
   if (value === "pinduoduo") return 2;
   if (value === "kuaishou") return 3;
+  if (value === "xianyu") return 4;
+  if (value === "wechat") return 5;
+  if (value === "video_account") return 6;
   return null;
+}
+
+function platformName(value) {
+  return ({ douyin: "抖音", pinduoduo: "拼多多", kuaishou: "快手", xianyu: "闲鱼", wechat: "微信", video_account: "视频号" })[value] || "";
 }
 
 async function getUserPermissions(userId) {
@@ -470,7 +478,7 @@ app.get("/api/brands", requireAuth, readScope, async (req, res, next) => {
     res.json(
       await query(
         `select id, name, remark,
-          case default_platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else '' end as defaultPlatform,
+          case default_platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' when 4 then 'xianyu' when 5 then 'wechat' when 6 then 'video_account' else '' end as defaultPlatform,
           sort_order as sortOrder, is_hidden as isHidden
          from brands
          where deleted_at is null and (? = 1 or is_hidden = 0)
@@ -802,6 +810,7 @@ async function applyInventoryOperation(connection, req, mode, body) {
   const label = body.label === "unsalable" ? "unsalable" : "salable";
   const labelCode = label === "salable" ? 1 : 2;
   const inboundType = body.inboundType === "new" ? 1 : 2;
+  const isRepair = mode === "in" && inboundType === 2 && Boolean(body.isRepair) ? 1 : 0;
   const platform = normalizePlatform(body.platform);
   const simultaneousInbound = Boolean(body.simultaneousInbound);
   const operationType = mode === "in" ? 1 : 2;
@@ -822,9 +831,9 @@ async function applyInventoryOperation(connection, req, mode, body) {
   await connection.execute("update sku_inventory set salable_qty = ?, unsalable_qty = ? where sku_id = ?", [salable, unsalable, skuId]);
   const [created] = await connection.execute(
     `insert into inventory_operation_logs
-      (sku_id, operation_type, inbound_type, stock_label, platform, quantity, simultaneous_inbound, remark, order_id, shop_name, shop_income, is_bug, source_product_text, operator_user_id)
-     values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [skuId, operationType, mode === "in" ? inboundType : null, labelCode, platform, quantity, mode === "out" && label === "unsalable" && simultaneousInbound ? 1 : 0, String(body.remark || "").trim(), body.orderId || null, body.shopName || null, body.shopIncome == null || body.shopIncome === "" ? null : Number(body.shopIncome), body.isBug ? 1 : 0, body.sourceProductText || null, req.user.id],
+      (sku_id, operation_type, inbound_type, is_repair, stock_label, platform, quantity, simultaneous_inbound, remark, order_id, shop_name, shop_income, is_bug, source_product_text, operator_user_id)
+     values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [skuId, operationType, mode === "in" ? inboundType : null, isRepair, labelCode, platform, quantity, mode === "out" && label === "unsalable" && simultaneousInbound ? 1 : 0, String(body.remark || "").trim(), body.orderId || null, body.shopName || null, body.shopIncome == null || body.shopIncome === "" ? null : Number(body.shopIncome), body.isBug ? 1 : 0, body.sourceProductText || null, req.user.id],
   );
   return { id: created.insertId, salableQty: salable, unsalableQty: unsalable };
 }
@@ -940,13 +949,30 @@ app.post("/api/inventory/orders/sync", requireAuth, requireAnyPermission(["INVEN
     const orders = Array.isArray(req.body.orders) ? req.body.orders : [];
     if (!platform) throw badRequest("平台不合法");
     if (!orders.length || orders.length > 500) throw badRequest("订单明细数量不合法");
-    const results = await withTransaction(async (connection) => {
+    const result = await withTransaction(async (connection) => {
       const [brands] = await connection.execute("select id, name from brands where deleted_at is null order by sort_order, id");
-      const created = [];
+      const prepared = [];
+      const failures = new Map();
+      const addFailure = (orderId, reason) => {
+        const normalizedOrderId = String(orderId || "未知订单").trim() || "未知订单";
+        const key = `${normalizedOrderId}\u0000${reason}`;
+        if (!failures.has(key)) failures.set(key, { orderId: normalizedOrderId, reason });
+      };
+
       for (const item of orders) {
+        const orderId = String(item.orderId || "").trim();
+        if (!orderId) {
+          addFailure("未知订单", "订单编号缺失");
+          continue;
+        }
         const text = String(item.productText || "").trim();
-        const quantity = toPositiveInteger(item.quantity, "数量");
-        if (!String(item.orderId || "").trim()) throw badRequest("订单编号不能为空");
+        let quantity;
+        try {
+          quantity = toPositiveInteger(item.quantity, "数量");
+        } catch {
+          addFailure(orderId, "数量不合法");
+          continue;
+        }
         const brand = findMatchingBrand(brands, text);
         let product = null;
         let sku = null;
@@ -962,28 +988,48 @@ app.post("/api/inventory/orders/sync", requireAuth, requireAnyPermission(["INVEN
             sku = findMatchingSku(skus, text);
           }
         }
+        if (!sku) {
+          addFailure(orderId, "未匹配");
+          continue;
+        }
         const orderMeta = {
-          orderId: String(item.orderId).slice(0, 64), shopName: String(item.shopName || "").slice(0, 128),
+          orderId: orderId.slice(0, 64), shopName: String(item.shopName || "").slice(0, 128),
           shopIncome: item.shopIncome, sourceProductText: text,
         };
-        if (sku) {
-          created.push(await applyInventoryOperation(connection, req, "out", {
-            skuId: sku.id, quantity, platform: req.body.platform, label: "salable",
-            remark: "拼多多打单同步", ...orderMeta,
-          }));
+        prepared.push({ skuId: Number(sku.id), quantity, platform: req.body.platform, label: "salable", remark: "拼多多打单同步", ...orderMeta });
+      }
+
+      const skuIds = [...new Set(prepared.map((item) => item.skuId))].sort((a, b) => a - b);
+      const availableBySku = new Map();
+      if (skuIds.length) {
+        const placeholders = skuIds.map(() => "?").join(",");
+        const [stocks] = await connection.execute(
+          `select sku_id as skuId, salable_qty as salableQty from sku_inventory where sku_id in (${placeholders}) order by sku_id for update`,
+          skuIds,
+        );
+        for (const stock of stocks) availableBySku.set(Number(stock.skuId), Number(stock.salableQty));
+      }
+
+      for (const item of prepared) {
+        const available = availableBySku.get(item.skuId) || 0;
+        if (item.quantity > available) {
+          addFailure(item.orderId, `库存不足（需${item.quantity}，可用${available}）`);
         } else {
-          const income = orderMeta.shopIncome == null || orderMeta.shopIncome === "" ? null : Number(orderMeta.shopIncome);
-          const [log] = await connection.execute(
-            `insert into inventory_operation_logs (sku_id,operation_type,inbound_type,stock_label,platform,quantity,remark,order_id,shop_name,shop_income,is_bug,source_product_text,matched_brand_id,matched_product_id,operator_user_id)
-             values(null,2,null,1,?,?,'拼多多打单同步',?,?,?,?,?,?,?,?)`,
-            [platform, quantity, orderMeta.orderId, orderMeta.shopName, income, 1, text, brand?.id || null, product?.id || null, req.user.id],
-          );
-          created.push({ id: log.insertId, isBug: true });
+          availableBySku.set(item.skuId, available - item.quantity);
         }
       }
-      return created;
+
+      if (failures.size) return { failures: [...failures.values()] };
+
+      const created = [];
+      for (const item of prepared) created.push(await applyInventoryOperation(connection, req, "out", item));
+      return { results: created };
     });
-    res.status(201).json({ results });
+    if (result.failures) {
+      res.status(422).json({ message: "订单未全部匹配且库存充足，本次未执行任何出库", errors: result.failures });
+      return;
+    }
+    res.status(201).json({ results: result.results });
   } catch (error) { next(error); }
 });
 
@@ -1159,8 +1205,8 @@ async function queryInventoryLogs(filters, paging = {}) {
   const limitParams = paging.limit ? [paging.limit, paging.offset || 0] : [];
   const rows = await query(
     `select l.id, l.operation_type as operationType, l.inbound_type as inboundType,
-        l.stock_label as stockLabel, l.quantity, l.simultaneous_inbound as simultaneousInbound,
-        case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else '' end as platform,
+        l.stock_label as stockLabel, l.is_repair as isRepair, l.quantity, l.simultaneous_inbound as simultaneousInbound,
+        case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' when 4 then 'xianyu' when 5 then 'wechat' when 6 then 'video_account' else '' end as platform,
         l.remark, l.order_id as orderId, l.shop_name as shopName, l.shop_income as shopIncome,
         l.is_bug as isBug, l.source_product_text as sourceProductText,
         date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt,
@@ -1600,7 +1646,7 @@ async function querySalesAmountRows(filters) {
   );
   const platformRows = await query(
     `select b.id as brandId,
-       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else 'none' end as platform,
+       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' when 4 then 'xianyu' when 5 then 'wechat' when 6 then 'video_account' else 'none' end as platform,
        sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as amount
      from inventory_operation_logs l
      join skus s on s.id = l.sku_id
@@ -1613,13 +1659,13 @@ async function querySalesAmountRows(filters) {
   );
   const platformAmounts = new Map();
   for (const row of platformRows) {
-    const current = platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, kuaishou: 0, none: 0 };
+    const current = platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, kuaishou: 0, xianyu: 0, wechat: 0, video_account: 0, none: 0 };
     current[row.platform] = Number(row.amount || 0);
     platformAmounts.set(row.brandId, current);
   }
   return rows.map((row) => ({
     ...row,
-    brandPlatformAmounts: platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, kuaishou: 0, none: 0 },
+    brandPlatformAmounts: platformAmounts.get(row.brandId) || { douyin: 0, pinduoduo: 0, kuaishou: 0, xianyu: 0, wechat: 0, video_account: 0, none: 0 },
   }));
 }
 
@@ -1627,7 +1673,7 @@ async function querySalesAmountPlatformBreakdown(filters) {
   const { startDate, endDate } = normalizeSalesAmountDateRange(filters);
   return query(
     `select b.id as brandId, p.id as productId, s.id as skuId,
-       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else 'none' end as platform,
+       case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' when 4 then 'xianyu' when 5 then 'wechat' when 6 then 'video_account' else 'none' end as platform,
        sum(case when l.operation_type = 2 then l.quantity * s.purchase_price else -l.quantity * s.purchase_price end) as amount
      from inventory_operation_logs l
      join skus s on s.id = l.sku_id
@@ -2015,7 +2061,7 @@ function addInventoryLogsSheet(workbook, logs) {
         row.skuName,
         row.operationType === 1 ? (row.inboundType === 1 ? "新货" : "退货") : "",
         row.stockLabel === 1 ? "可售" : "不可售",
-        row.platform === "douyin" ? "抖音" : row.platform === "pinduoduo" ? "拼多多" : row.platform === "kuaishou" ? "快手" : "",
+        platformName(row.platform),
         row.quantity,
         row.operatorName,
         row.remark,
@@ -2585,7 +2631,7 @@ async function buildSalesAmountWorkbook(filters) {
   const productPlatformTotals = new Map();
   const brandPlatformTotals = new Map();
   const addPlatformAmount = (map, key, platform, amount) => {
-    const current = map.get(key) || { douyin: 0, pinduoduo: 0, kuaishou: 0, none: 0 };
+    const current = map.get(key) || { douyin: 0, pinduoduo: 0, kuaishou: 0, xianyu: 0, wechat: 0, video_account: 0, none: 0 };
     current[platform] = (current[platform] || 0) + Number(amount || 0);
     map.set(key, current);
   };
@@ -2600,11 +2646,14 @@ async function buildSalesAmountWorkbook(filters) {
     addPlatformAmount(brandPlatformTotals, row.brandId, row.platform, row.amount);
   }
   const platformText = (amounts) => {
-    const source = amounts || { douyin: 0, pinduoduo: 0, kuaishou: 0, none: 0 };
+    const source = amounts || { douyin: 0, pinduoduo: 0, kuaishou: 0, xianyu: 0, wechat: 0, video_account: 0, none: 0 };
     const lines = [
       ["拼多多", source.pinduoduo || 0],
       ["抖音", source.douyin || 0],
       ["快手", source.kuaishou || 0],
+      ["闲鱼", source.xianyu || 0],
+      ["微信", source.wechat || 0],
+      ["视频号", source.video_account || 0],
     ];
     if (Number(source.none || 0) !== 0) lines.push(["未选择", source.none || 0]);
     return lines.map(([label, amount]) => `${label}：¥${Number(amount).toFixed(2)}`).join("\n");
@@ -2660,7 +2709,7 @@ async function buildExportWorkbook() {
     query(
       `select date_format(l.created_at, '%Y-%m-%d %H:%i:%s') as createdAt,
           l.operation_type as operationType, l.inbound_type as inboundType, l.stock_label as stockLabel,
-          case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' else '' end as platform,
+          case l.platform when 1 then 'douyin' when 2 then 'pinduoduo' when 3 then 'kuaishou' when 4 then 'xianyu' when 5 then 'wechat' when 6 then 'video_account' else '' end as platform,
           b.name as brandName, p.name as productName, s.name as skuName, l.quantity, u.name as operatorName, l.remark
        from inventory_operation_logs l
        join users u on u.id = l.operator_user_id
@@ -2718,7 +2767,7 @@ async function buildExportWorkbook() {
         row.skuName,
         row.operationType === 1 ? (row.inboundType === 1 ? "新货" : "退货") : "",
         row.stockLabel === 1 ? "可售" : "不可售",
-        row.platform === "douyin" ? "抖音" : row.platform === "pinduoduo" ? "拼多多" : row.platform === "kuaishou" ? "快手" : "",
+        platformName(row.platform),
         row.quantity,
         row.operatorName,
         row.remark,
@@ -2762,7 +2811,7 @@ function buildImportSql(workbook) {
     const operationType = row["类型"] === "入库" ? 1 : 2;
     const inboundType = row["入库类型"] === "新货" ? 1 : row["入库类型"] === "退货" ? 2 : "null";
     const stockLabel = row["标签"] === "不可售" ? 2 : 1;
-    const platform = row["平台"] === "抖音" ? 1 : row["平台"] === "拼多多" ? 2 : row["平台"] === "快手" ? 3 : "null";
+    const platform = row["平台"] === "抖音" ? 1 : row["平台"] === "拼多多" ? 2 : row["平台"] === "快手" ? 3 : row["平台"] === "闲鱼" ? 4 : row["平台"] === "微信" ? 5 : row["平台"] === "视频号" ? 6 : "null";
     lines.push(`insert into inventory_operation_logs(sku_id, operation_type, inbound_type, stock_label, platform, quantity, simultaneous_inbound, remark, operator_user_id, created_at) select s.id, ${operationType}, ${inboundType}, ${stockLabel}, ${platform}, ${Number(row["数量"] || 0)}, 0, ${sqlValue(row["备注"])}, u.id, ${sqlValue(row["时间"])} from skus s join products p on p.id = s.product_id join brands b on b.id = p.brand_id join users u on u.name = ${sqlValue(row["操作人"])} where b.name = ${sqlValue(row["品牌名"])} and p.name = ${sqlValue(row["商品名"])} and s.name = ${sqlValue(row["规格名"])};`);
   }
   lines.push("commit;");

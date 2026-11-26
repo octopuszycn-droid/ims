@@ -24,8 +24,12 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
       await chrome.storage.local.remove('token');
       throw new Error('IMS 登录已过期，请先登录 IMS 后再同步。');
     }
-    if (!response.ok) throw new Error(body.error || body.message || `请求失败：${response.status}`);
+    if (!response.ok) {
+      const error = new Error(body.error || body.message || `请求失败：${response.status}`);
+      error.failures = Array.isArray(body.errors) ? body.errors : [];
+      throw error;
+    }
     return body;
-  })().then((data) => respond({ ok: true, data })).catch((error) => respond({ ok: false, error: error.message }));
+  })().then((data) => respond({ ok: true, data })).catch((error) => respond({ ok: false, error: error.message, failures: error.failures || [] }));
   return true;
 });

@@ -37,6 +37,14 @@ const serverExpiryAt = new Date(`${serverExpiryDate}T00:00:00+08:00`).getTime();
 const serverExpiryWarningDays = 10;
 const dayMs = 24 * 60 * 60 * 1000;
 const emptyLogFilters: InventoryLogFilters = { startAt: "", endAt: "", operationType: "", brandId: "", productId: "", inboundType: "", stockLabel: "", platform: "" };
+const platformOptions: Array<{ value: Exclude<PlatformValue, "">; label: string }> = [
+  { value: "douyin", label: "抖音" },
+  { value: "pinduoduo", label: "拼多多" },
+  { value: "kuaishou", label: "快手" },
+  { value: "xianyu", label: "闲鱼" },
+  { value: "wechat", label: "微信" },
+  { value: "video_account", label: "视频号" },
+];
 const tableBase = "w-full border-collapse text-left text-sm";
 const thBase = "border border-slate-200 bg-slate-50 px-4 py-2 text-left font-medium text-slate-600";
 const tdBase = "border border-slate-200 px-4 py-2 align-middle";
@@ -526,7 +534,7 @@ export function App() {
       simultaneousInbound: false,
       platform: type === "outbound" ? getOutboundPlatform(firstVisibleBrand) : "",
       remark: "",
-      rows: [{ skuId: "", quantity: 1, platform: type === "outbound" ? getOutboundPlatform(firstVisibleBrand) : "", orderId: "", shopIncome: "", remark: "", inboundType: "new", label: "salable" }],
+      rows: [{ skuId: "", quantity: 1, platform: type === "outbound" ? getOutboundPlatform(firstVisibleBrand) : "", orderId: "", shopIncome: "", remark: "", inboundType: "new", isRepair: false, label: "salable" }],
     });
     setDialog(type);
     if (firstVisibleBrand?.id) await loadModalProducts(firstVisibleBrand.id, undefined, false);
@@ -616,8 +624,9 @@ export function App() {
         await api.inventoryOperationsBatch(token, dialog === "inbound" ? "in" : "out", rows.map((row: Record<string, any>) => ({
           skuId: Number(row.skuId),
           quantity: Number(row.quantity),
-          label: dialog === "outbound" ? "salable" : row.label,
+          label: "salable",
           inboundType: dialog === "inbound" ? row.inboundType : "new",
+          isRepair: dialog === "inbound" && row.inboundType === "return" && Boolean(row.isRepair),
           simultaneousInbound: false,
           platform: row.platform || "",
           orderId: dialog === "outbound" ? String(row.orderId || "").trim() : "",
@@ -1916,7 +1925,7 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
               <div className="flex items-start justify-between gap-3 border-b bg-slate-50 px-3 py-2">
                 <div>
                   <h3 className="font-semibold text-slate-950">{brand.brandName}</h3>
-                  <p className="text-xs text-slate-500">可售 {brand.salableQty} / 不可售 {brand.unsalableQty}</p>
+                  <p className="text-xs text-slate-500">可售 {brand.salableQty}</p>
                 </div>
                 <span className="shrink-0 rounded-md bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-700">总 {brand.totalQty}</span>
               </div>
@@ -1927,7 +1936,6 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
                       <th className="border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">商品名</th>
                       <th className="w-14 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">总</th>
                       <th className="w-14 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">可售</th>
-                      <th className="w-16 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">不可售</th>
                       <th className="w-14 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">占比</th>
                     </tr>
                   </thead>
@@ -1939,7 +1947,6 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
                           <td className="break-words border border-slate-200 px-2 py-1.5">{row.productName}</td>
                           <td className="border border-slate-200 px-2 py-1.5">{row.totalQty}</td>
                           <td className="border border-slate-200 px-2 py-1.5">{row.salableQty}</td>
-                          <td className="border border-slate-200 px-2 py-1.5">{row.unsalableQty}</td>
                           <td className="border border-slate-200 px-2 py-1.5">{rate}%</td>
                         </tr>
                       );
@@ -1948,7 +1955,6 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
                       <td className="border border-slate-200 px-2 py-1.5">总计</td>
                       <td className="border border-slate-200 px-2 py-1.5">{brand.totalQty}</td>
                       <td className="border border-slate-200 px-2 py-1.5">{brand.salableQty}</td>
-                      <td className="border border-slate-200 px-2 py-1.5">{brand.unsalableQty}</td>
                       <td className="border border-slate-200 px-2 py-1.5">{total.totalQty ? Math.floor((brand.totalQty / total.totalQty) * 100) : 0}%</td>
                     </tr>
                   </tbody>
@@ -1965,7 +1971,6 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
                 <th className={thBase}>商品名</th>
                 <th className={thBase}>库存总量</th>
                 <th className={thBase}>可售库存数</th>
-                <th className={thBase}>不可售库存数</th>
                 <th className={thBase}>占有率</th>
               </tr>
             </thead>
@@ -1991,7 +1996,6 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
                       <td className={tdBase}>{row.productName}</td>
                       <td className={tdBase}>{row.totalQty}</td>
                       <td className={tdBase}>{row.salableQty}</td>
-                      <td className={tdBase}>{row.unsalableQty}</td>
                       <td className={tdBase}>{rate}%</td>
                     </tr>
                     {isLastBrandRow && (
@@ -1999,7 +2003,6 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
                         <td className={tdBase}>总计</td>
                         <td className={tdBase}>{brandTotal.totalQty}</td>
                         <td className={tdBase}>{brandTotal.salableQty}</td>
-                        <td className={tdBase}>{brandTotal.unsalableQty}</td>
                         <td className={tdBase}>{total.totalQty ? Math.floor((brandTotal.totalQty / total.totalQty) * 100) : 0}%</td>
                       </tr>
                     )}
@@ -2012,10 +2015,9 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
         <PaginationBar {...pagination} onPageChange={pagination.setPage} />
         <div className="rounded-lg border border-slate-200 bg-white p-3 md:hidden">
           <h3 className="mb-2 font-semibold text-slate-950">全部总计</h3>
-          <div className="grid grid-cols-3 gap-2 text-center text-sm">
+          <div className="grid grid-cols-2 gap-2 text-center text-sm">
             <div className="rounded-md bg-slate-50 p-2"><p className="text-xs text-slate-500">总</p><p className="font-semibold">{total.totalQty}</p></div>
             <div className="rounded-md bg-slate-50 p-2"><p className="text-xs text-slate-500">可售</p><p className="font-semibold">{total.salableQty}</p></div>
-            <div className="rounded-md bg-slate-50 p-2"><p className="text-xs text-slate-500">不可售</p><p className="font-semibold">{total.unsalableQty}</p></div>
           </div>
         </div>
         <div className="hidden overflow-auto md:block">
@@ -2025,7 +2027,6 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
               <th className={thBase}></th>
               <th className={thBase}>库存总量</th>
               <th className={thBase}>可售库存数</th>
-              <th className={thBase}>不可售库存数</th>
               <th className={thBase}>占有率</th>
             </tr>
           </thead>
@@ -2034,7 +2035,6 @@ function ProductInventoryTable({ rows }: { rows: ProductInventoryRow[] }) {
               <td className={tdBase}>总计</td>
               <td className={tdBase}>{total.totalQty}</td>
               <td className={tdBase}>{total.salableQty}</td>
-              <td className={tdBase}>{total.unsalableQty}</td>
               <td className={tdBase}>100%</td>
             </tr>
           </tbody>
@@ -2162,7 +2162,7 @@ function SkuInventoryPage({
               <div className="flex items-center justify-between gap-3 border-b bg-slate-50 px-3 py-2">
                 <div>
                   <h3 className="font-semibold text-slate-950">{brand.brandName}</h3>
-                  <p className="text-xs text-slate-500">可售 {brand.salableQty} / 不可售 {brand.unsalableQty}</p>
+                  <p className="text-xs text-slate-500">可售 {brand.salableQty}</p>
                 </div>
                 <span className="rounded-md bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-700">总 {brand.totalQty}</span>
               </div>
@@ -2178,8 +2178,8 @@ function SkuInventoryPage({
                         <tr className="text-left text-xs text-slate-500">
                           <th className="border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">规格名</th>
                           <th className="w-16 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">可售</th>
-                          <th className="w-20 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">不可售</th>
                           <th className="w-14 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">总</th>
+                          <th className="w-12 border border-slate-200 bg-slate-50 px-2 py-1.5 font-medium">操作</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -2190,21 +2190,14 @@ function SkuInventoryPage({
                             <tr key={row.skuId}>
                               <td className="break-words border border-slate-200 px-2 py-1.5">{row.skuName}</td>
                               <td className={["border border-slate-200 px-2 py-1.5", salable === 0 ? "bg-red-50 font-semibold text-red-700" : salable === 1 ? "bg-amber-50 font-semibold text-amber-700" : ""].join(" ")}>{salable}</td>
-                              <td className="border border-slate-200 px-2 py-1.5">
-                                <span className="inline-flex items-center gap-1">
-                                  {unsalable}
-                                  {canWrite && unsalable > 0 && (
-                                    <button
-                                      type="button"
-                                      className="inline-flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-50"
-                                      onClick={() => onAdjust(row)}
-                                    >
-                                      <PencilLine className="h-3.5 w-3.5" />
-                                    </button>
-                                  )}
-                                </span>
-                              </td>
                               <td className="border border-slate-200 px-2 py-1.5">{salable + unsalable}</td>
+                              <td className="border border-slate-200 px-2 py-1.5 text-center">
+                                {canWrite && unsalable > 0 && (
+                                  <button type="button" title="调整不可售库存" aria-label="调整不可售库存" className="inline-flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-50" onClick={() => onAdjust(row)}>
+                                    <PencilLine className="h-3.5 w-3.5" />
+                                  </button>
+                                )}
+                              </td>
                             </tr>
                           );
                         })}
@@ -2225,7 +2218,7 @@ function SkuInventoryPage({
                 <th className={thBase}>规格名</th>
                 <th className={thBase}>库存总量</th>
                 <th className={thBase}>可售库存数</th>
-                <th className={thBase}>不可售库存数</th>
+                <th className={thBase}>操作</th>
               </tr>
             </thead>
             <tbody>
@@ -2241,18 +2234,11 @@ function SkuInventoryPage({
                     <td className={tdBase}>{salable + Number(row.unsalableQty)}</td>
                     <td className={[tdBase, salable === 0 ? "bg-red-100 font-semibold text-red-700" : salable === 1 ? "bg-amber-100 font-semibold text-amber-700" : ""].join(" ")}>{salable}</td>
                     <td className={tdBase}>
-                      <span className="inline-flex items-center gap-2">
-                        {row.unsalableQty}
-                        {canWrite && Number(row.unsalableQty) > 0 && (
-                          <button
-                            type="button"
-                            className="inline-flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-50"
-                            onClick={() => onAdjust(row)}
-                          >
-                            <PencilLine className="h-4 w-4" />
-                          </button>
-                        )}
-                      </span>
+                      {canWrite && Number(row.unsalableQty) > 0 && (
+                        <button type="button" title="调整不可售库存" aria-label="调整不可售库存" className="inline-flex h-6 w-6 items-center justify-center rounded-md text-blue-600 hover:bg-blue-50" onClick={() => onAdjust(row)}>
+                          <PencilLine className="h-4 w-4" />
+                        </button>
+                      )}
                     </td>
                   </tr>
                 );
@@ -2402,23 +2388,12 @@ function LogTable({
             <option className="text-slate-800" value="2">退货</option>
           </Select>
           <Select
-            className={["h-10 w-full sm:w-28", filters.stockLabel ? "" : "text-slate-400"].join(" ")}
-            value={filters.stockLabel}
-            onChange={(event) => patchFilters({ stockLabel: event.target.value as InventoryLogFilters["stockLabel"] })}
-          >
-            <option className="text-slate-400" value="">全部标签</option>
-            <option className="text-slate-800" value="1">可售</option>
-            <option className="text-slate-800" value="2">不可售</option>
-          </Select>
-          <Select
             className={["h-10 w-full sm:w-28", filters.platform ? "" : "text-slate-400"].join(" ")}
             value={filters.platform}
             onChange={(event) => patchFilters({ platform: event.target.value as InventoryLogFilters["platform"] })}
           >
             <option className="text-slate-400" value="">全部平台</option>
-            <option className="text-slate-800" value="douyin">抖音</option>
-            <option className="text-slate-800" value="pinduoduo">拼多多</option>
-            <option className="text-slate-800" value="kuaishou">快手</option>
+            {platformOptions.map((option) => <option className="text-slate-800" key={option.value} value={option.value}>{option.label}</option>)}
           </Select>
           <Button className="w-full sm:w-auto" onClick={onExport}>导出</Button>
         </div>
@@ -2441,7 +2416,7 @@ function LogTable({
               <div className="grid grid-cols-2 gap-x-4 gap-y-2">
                 <InfoLine label="数量" value={log.quantity} />
                 <InfoLine label="平台" value={platformLabel(log.platform) || "-"} />
-                <InfoLine label="标签" value={<StockLabelText value={log.stockLabel} />} />
+                <InfoLine label="维修" value={log.isRepair ? "已维修" : "-"} />
                 <InfoLine label="入库类型" value={log.operationType === 1 ? <InboundTypeText value={log.inboundType} /> : "-"} />
                 <InfoLine label="操作人" value={log.operatorName} />
                 <InfoLine label="备注" value={log.remark || "-"} />
@@ -2463,7 +2438,7 @@ function LogTable({
               <th className={thBase}>商品名</th>
               <th className={thBase}>规格名</th>
               <th className={thBase}>入库类型</th>
-              <th className={thBase}>标签</th>
+              <th className={thBase}>维修</th>
               <th className={thBase}>平台</th>
               <th className={thBase}>数量</th>
               <th className={thBase}>操作人</th>
@@ -2480,7 +2455,7 @@ function LogTable({
                 <td className={tdBase}>{log.productName}</td>
                 <td className={tdBase}>{log.skuName}</td>
                 <td className={tdBase}>{log.operationType === 1 ? <InboundTypeText value={log.inboundType} /> : ""}</td>
-                <td className={tdBase}><StockLabelText value={log.stockLabel} /></td>
+                <td className={tdBase}>{log.isRepair ? "已维修" : "-"}</td>
                 <td className={tdBase}>{platformLabel(log.platform)}</td>
                 <td className={tdBase}>{log.quantity}</td>
                 <td className={tdBase}>{log.operatorName}</td>
@@ -2592,8 +2567,11 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
 
   useEffect(() => {
     void loadRecords();
-    void loadAbnormalLogs(1);
   }, [token]);
+
+  useEffect(() => {
+    void loadAbnormalLogs(1, abnormalDateRange);
+  }, [token, abnormalDateRange]);
 
   async function openDetail(id: number) {
     setLoading(true);
@@ -2923,14 +2901,9 @@ function InventoryCheckPage({ token, canUpload, onInventoryChanged }: { token: s
           <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
             <DateRangePicker2
               filters={abnormalDateRange}
-              onChange={(range) => {
-                setAbnormalDateRange(range);
-                void loadAbnormalLogs(1, range);
-              }}
+              onChange={setAbnormalDateRange}
               onClear={() => {
-                const range = { startAt: "", endAt: "" };
-                setAbnormalDateRange(range);
-                void loadAbnormalLogs(1, range);
+                setAbnormalDateRange({ startAt: "", endAt: "" });
               }}
             />
             <Button onClick={() => void exportAbnormalLogs()} disabled={isExportingAbnormal}>
@@ -3199,13 +3172,16 @@ function formatMoney(value: number) {
   return `¥${Number(value || 0).toFixed(2)}`;
 }
 
-function PlatformAmountBreakdown({ amounts }: { amounts?: { douyin: number; pinduoduo: number; kuaishou: number; none: number } }) {
+function PlatformAmountBreakdown({ amounts }: { amounts?: Record<Exclude<PlatformValue, ""> | "none", number> }) {
   if (!amounts) return null;
   return (
     <div className="mt-1 space-y-0.5 text-xs font-normal text-slate-500">
       <div>拼多多：{formatMoney(amounts.pinduoduo || 0)}</div>
       <div>抖音：{formatMoney(amounts.douyin || 0)}</div>
       <div>快手：{formatMoney(amounts.kuaishou || 0)}</div>
+      <div>闲鱼：{formatMoney(amounts.xianyu || 0)}</div>
+      <div>微信：{formatMoney(amounts.wechat || 0)}</div>
+      <div>视频号：{formatMoney(amounts.video_account || 0)}</div>
       {Number(amounts.none || 0) !== 0 && <div>未选择：{formatMoney(amounts.none || 0)}</div>}
     </div>
   );
@@ -3237,6 +3213,9 @@ type AmountRow = {
     douyin: number;
     pinduoduo: number;
     kuaishou: number;
+    xianyu: number;
+    wechat: number;
+    video_account: number;
     none: number;
   };
 };
@@ -3321,7 +3300,7 @@ function AmountTable({
     return totals;
   }, [rows]);
   const brandPlatformAmounts = useMemo(() => {
-    const amounts = new Map<number, { douyin: number; pinduoduo: number; kuaishou: number; none: number }>();
+    const amounts = new Map<number, NonNullable<AmountRow["brandPlatformAmounts"]>>();
     for (const row of rows) {
       if (row.brandPlatformAmounts && !amounts.has(row.brandId)) amounts.set(row.brandId, row.brandPlatformAmounts);
     }
@@ -3334,7 +3313,7 @@ function AmountTable({
       totalAmount: number;
       salableAmount: number;
       unsalableAmount: number;
-      platformAmounts?: { douyin: number; pinduoduo: number; kuaishou: number; none: number };
+      platformAmounts?: NonNullable<AmountRow["brandPlatformAmounts"]>;
       products: typeof productGroups;
     }>();
 
@@ -3625,6 +3604,9 @@ function SalesAmountPage({ token }: { token: string }) {
                 douyin: Number(row.brandPlatformAmounts.douyin || 0),
                 pinduoduo: Number(row.brandPlatformAmounts.pinduoduo || 0),
                 kuaishou: Number(row.brandPlatformAmounts.kuaishou || 0),
+                xianyu: Number(row.brandPlatformAmounts.xianyu || 0),
+                wechat: Number(row.brandPlatformAmounts.wechat || 0),
+                video_account: Number(row.brandPlatformAmounts.video_account || 0),
                 none: Number(row.brandPlatformAmounts.none || 0),
               }
             : undefined,
@@ -3720,6 +3702,9 @@ function DefaultPlatformPicker({ value, onChange }: { value: string; onChange: (
     { value: "pinduoduo", label: "拼多多" },
     { value: "douyin", label: "抖音" },
     { value: "kuaishou", label: "快手" },
+    { value: "xianyu", label: "闲鱼" },
+    { value: "wechat", label: "微信" },
+    { value: "video_account", label: "视频号" },
   ];
 
   return (
@@ -3772,7 +3757,11 @@ function EditorDialog({
   const skuOptions = (modalSkus.length ? modalSkus : []).filter((sku) => !sku.isHidden);
   const updateRow = (index: number, key: string, value: unknown) => {
     const rows = Array.isArray(form.rows) ? [...form.rows] : [];
-    rows[index] = { ...rows[index], [key]: value };
+    rows[index] = {
+      ...rows[index],
+      [key]: value,
+      ...(key === "inboundType" && value !== "return" ? { isRepair: false } : {}),
+    };
     onChange("rows", rows);
   };
   const addRow = (row: Record<string, unknown>) => onChange("rows", [...(Array.isArray(form.rows) ? form.rows : []), row]);
@@ -3872,21 +3861,24 @@ function EditorDialog({
               {(dialog === "inbound" || dialog === "outbound") ? (
                 <Field label="规格行">
                   <div className="space-y-2">
-                    <div className={`hidden gap-2 px-1 text-xs text-slate-500 sm:grid ${dialog === "inbound" ? "sm:grid-cols-[minmax(0,1.5fr)_5rem_6.5rem_6.5rem_7rem_minmax(7rem,1fr)_5rem]" : "sm:grid-cols-[minmax(0,1.35fr)_4.5rem_6.5rem_minmax(7rem,1fr)_6.5rem_minmax(7rem,1fr)_5rem]"}`}>
-                      <span>规格名</span><span>数量</span>{dialog === "inbound" && <><span>类型</span><span>标签</span></>}<span>平台</span>{dialog === "outbound" && <><span>订单编号</span><span>实收金额</span></>}<span>备注</span><span />
+                    <div className={`hidden gap-2 px-1 text-xs text-slate-500 sm:grid ${dialog === "inbound" ? "sm:grid-cols-[minmax(0,1.5fr)_5rem_6.5rem_5rem_7rem_minmax(7rem,1fr)_5rem]" : "sm:grid-cols-[minmax(0,1.35fr)_4.5rem_6.5rem_minmax(7rem,1fr)_6.5rem_minmax(7rem,1fr)_5rem]"}`}>
+                      <span>规格名</span><span>数量</span>{dialog === "inbound" && <><span>类型</span><span>维修</span></>}<span>平台</span>{dialog === "outbound" && <><span>订单编号</span><span>实收金额</span></>}<span>备注</span><span />
                     </div>
                     {(form.rows || []).map((row: Record<string, any>, index: number) => (
-                      <div key={index} className={`grid grid-cols-2 gap-2 rounded-md border border-slate-200 p-2 sm:items-center sm:border-0 sm:p-0 ${dialog === "inbound" ? "sm:grid-cols-[minmax(0,1.5fr)_5rem_6.5rem_6.5rem_7rem_minmax(7rem,1fr)_5rem]" : "sm:grid-cols-[minmax(0,1.35fr)_4.5rem_6.5rem_minmax(7rem,1fr)_6.5rem_minmax(7rem,1fr)_5rem]"}`}>
+                      <div key={index} className={`grid grid-cols-2 gap-2 rounded-md border border-slate-200 p-2 sm:items-center sm:border-0 sm:p-0 ${dialog === "inbound" ? "sm:grid-cols-[minmax(0,1.5fr)_5rem_6.5rem_5rem_7rem_minmax(7rem,1fr)_5rem]" : "sm:grid-cols-[minmax(0,1.35fr)_4.5rem_6.5rem_minmax(7rem,1fr)_6.5rem_minmax(7rem,1fr)_5rem]"}`}>
                         <Select aria-label="规格名" className="col-span-2 min-w-0 sm:col-span-1" value={String(row.skuId || "")} onChange={(event) => updateRow(index, "skuId", event.target.value ? Number(event.target.value) : "")} required>
                           <option value="">请选择规格</option>{skuOptions.map((sku) => <option key={sku.id} value={sku.id}>{sku.name}</option>)}
                         </Select>
                         <Input aria-label="数量" type="number" min="1" step="1" value={row.quantity ?? 1} onChange={(event) => updateRow(index, "quantity", event.target.value)} required />
                         {dialog === "inbound" && <>
                           <Select aria-label="入库类型" value={row.inboundType || "new"} onChange={(event) => updateRow(index, "inboundType", event.target.value)}><option value="new">新货</option><option value="return">退货</option></Select>
-                          <Select aria-label="标签" value={row.label || "salable"} onChange={(event) => updateRow(index, "label", event.target.value)}><option value="salable">可售</option><option value="unsalable">不可售</option></Select>
+                          <label className={`inline-flex min-h-10 items-center gap-1.5 whitespace-nowrap rounded-md px-1 text-sm text-slate-700 ${row.inboundType === "return" ? "" : "invisible"}`}>
+                            <input type="checkbox" checked={Boolean(row.isRepair)} onChange={(event) => updateRow(index, "isRepair", event.target.checked)} aria-label="维修" />
+                            维修
+                          </label>
                         </>}
                         <Select aria-label="平台" value={row.platform || ""} onChange={(event) => updateRow(index, "platform", event.target.value)}>
-                          <option value="">平台</option><option value="douyin">抖音</option><option value="pinduoduo">拼多多</option><option value="kuaishou">快手</option>
+                          <option value="" disabled hidden>请选择平台</option>{platformOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                         </Select>
                         {dialog === "outbound" && <>
                           <Input aria-label="订单编号" placeholder="订单编号" value={row.orderId || ""} onChange={(event) => updateRow(index, "orderId", event.target.value)} />
@@ -3895,7 +3887,7 @@ function EditorDialog({
                         <Input aria-label="备注" placeholder="备注" value={row.remark || ""} onChange={(event) => updateRow(index, "remark", event.target.value)} />
                         <div className="col-span-2 flex justify-end gap-1 sm:col-span-1">
                           {form.rows.length > 1 && <Button type="button" variant="ghost" size="sm" aria-label="删除此行" onClick={() => removeRow(index)}><X className="h-4 w-4" /></Button>}
-                          {index === form.rows.length - 1 && <Button type="button" variant="secondary" size="sm" aria-label="新增一行" onClick={() => addRow({ skuId: "", quantity: 1, platform: row.platform || "", orderId: "", shopIncome: "", remark: "", inboundType: "new", label: "salable" })}><Plus className="h-4 w-4" /></Button>}
+                          {index === form.rows.length - 1 && <Button type="button" variant="secondary" size="sm" aria-label="新增一行" onClick={() => addRow({ skuId: "", quantity: 1, platform: row.platform || "", orderId: "", shopIncome: "", remark: "", inboundType: "new", isRepair: false, label: "salable" })}><Plus className="h-4 w-4" /></Button>}
                         </div>
                       </div>
                     ))}
@@ -4011,11 +4003,6 @@ function InboundTypeText({ value }: { value: number | null | undefined }) {
   return <span className={isReturn ? "font-medium text-red-600" : undefined}>{isReturn ? "退货" : "新货"}</span>;
 }
 
-function StockLabelText({ value }: { value: number }) {
-  const isUnsalable = Number(value) === 2;
-  return <span className={isUnsalable ? "font-medium text-red-600" : undefined}>{isUnsalable ? "不可售" : "可售"}</span>;
-}
-
 function AbnormalQuantityText({ log }: { log: InventoryAbnormalLog }) {
   return (
     <>
@@ -4029,6 +4016,9 @@ function platformLabel(value?: string) {
   if (value === "douyin") return "抖音";
   if (value === "pinduoduo") return "拼多多";
   if (value === "kuaishou") return "快手";
+  if (value === "xianyu") return "闲鱼";
+  if (value === "wechat") return "微信";
+  if (value === "video_account") return "视频号";
   return "";
 }
 

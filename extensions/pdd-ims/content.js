@@ -55,5 +55,12 @@ function extractOrders() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, respond) => {
-  if (message?.type === 'IMS_SELECTED_ORDERS') respond({ orders: extractOrders() });
+  if (message?.type === 'IMS_SELECTED_ORDERS') {
+    respond({ orders: extractOrders() });
+    return;
+  }
+  if (message?.type === 'IMS_SYNC_FAILURE') {
+    window.alert(message.text || '订单同步失败，本次未扣减库存。');
+    respond({ ok: true });
+  }
 });
