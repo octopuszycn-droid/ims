@@ -1043,6 +1043,7 @@ export function App() {
           products={products}
           modalProducts={modalProducts}
           modalSkus={modalSkus}
+          skuInventory={skuInventory}
           currentStock={currentStock}
           onChange={handleFormChange}
           onBrandChange={async (brandId) => {
@@ -3732,6 +3733,7 @@ function EditorDialog({
   products,
   modalProducts,
   modalSkus,
+  skuInventory,
   onChange,
   onBrandChange,
   onProductChange,
@@ -3746,6 +3748,7 @@ function EditorDialog({
   products: Product[];
   modalProducts: Product[];
   modalSkus: Sku[];
+  skuInventory: SkuInventoryRow[];
   onChange: (key: string, value: unknown) => void;
   onBrandChange: (brandId: number) => Promise<void>;
   onProductChange: (productId: number) => Promise<void>;
@@ -3865,10 +3868,17 @@ function EditorDialog({
                       <span>规格名</span><span>数量</span>{dialog === "inbound" && <><span>类型</span><span>维修</span></>}<span>平台</span>{dialog === "outbound" && <><span>订单编号</span><span>实收金额</span></>}<span>备注</span><span />
                     </div>
                     {(form.rows || []).map((row: Record<string, any>, index: number) => (
-                      <div key={index} className={`grid grid-cols-2 gap-2 rounded-md border border-slate-200 p-2 sm:items-center sm:border-0 sm:p-0 ${dialog === "inbound" ? "sm:grid-cols-[minmax(0,1.5fr)_5rem_6.5rem_5rem_7rem_minmax(7rem,1fr)_5rem]" : "sm:grid-cols-[minmax(0,1.35fr)_4.5rem_6.5rem_minmax(7rem,1fr)_6.5rem_minmax(7rem,1fr)_5rem]"}`}>
-                        <Select aria-label="规格名" className="col-span-2 min-w-0 sm:col-span-1" value={String(row.skuId || "")} onChange={(event) => updateRow(index, "skuId", event.target.value ? Number(event.target.value) : "")} required>
-                          <option value="">请选择规格</option>{skuOptions.map((sku) => <option key={sku.id} value={sku.id}>{sku.name}</option>)}
-                        </Select>
+                      <div key={index} className={`grid grid-cols-2 gap-2 rounded-md border border-slate-200 p-2 sm:items-start sm:border-0 sm:p-0 ${dialog === "inbound" ? "sm:grid-cols-[minmax(0,1.5fr)_5rem_6.5rem_5rem_7rem_minmax(7rem,1fr)_5rem]" : "sm:grid-cols-[minmax(0,1.35fr)_4.5rem_6.5rem_minmax(7rem,1fr)_6.5rem_minmax(7rem,1fr)_5rem]"}`}>
+                        <div className="col-span-2 min-w-0 sm:col-span-1">
+                          <Select aria-label="规格名" className="min-w-0" value={String(row.skuId || "")} onChange={(event) => updateRow(index, "skuId", event.target.value ? Number(event.target.value) : "")} required>
+                            <option value="">请选择规格</option>{skuOptions.map((sku) => <option key={sku.id} value={sku.id}>{sku.name}</option>)}
+                          </Select>
+                          {dialog === "outbound" && row.skuId && (
+                            <p className="mt-1 text-xs font-medium text-red-600">
+                              剩余库存数：{skuInventory.find((item) => item.skuId === Number(row.skuId))?.salableQty ?? 0}
+                            </p>
+                          )}
+                        </div>
                         <Input aria-label="数量" type="number" min="1" step="1" value={row.quantity ?? 1} onChange={(event) => updateRow(index, "quantity", event.target.value)} required />
                         {dialog === "inbound" && <>
                           <Select aria-label="入库类型" value={row.inboundType || "new"} onChange={(event) => updateRow(index, "inboundType", event.target.value)}><option value="new">新货</option><option value="return">退货</option></Select>
